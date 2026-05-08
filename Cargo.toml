@@ -2,12 +2,12 @@
 members = [".", "python"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/Atero-ai/fastokens"
-homepage = "https://github.com/Atero-ai/fastokens"
-documentation = "https://github.com/Atero-ai/fastokens/blob/main/README.md"
+repository = "https://github.com/crusoecloud/fastokens"
+homepage = "https://github.com/crusoecloud/fastokens"
+documentation = "https://github.com/crusoecloud/fastokens/blob/main/README.md"
 
 [package]
 name = "fastokens"

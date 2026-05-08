@@ -5,8 +5,8 @@ popular open-weight LLMs, built on top of a high-performance Rust backend.
 
 `fastokens` can be installed from source:
 ```
-git clone https://github.com/atero-ai/fast-tokens
-uv pip install fast-tokens/python
+git clone https://github.com/crusoecloud/fastokens
+uv pip install fastokens/python
 ```
 
 The Python API lives in the `python` directory. To use `fastokens` as a drop-in replacement with

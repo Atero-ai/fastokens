@@ -418,9 +418,17 @@ class _ModelStub:
     def __init__(self, shim: _TokenizerShim) -> None:
         self._shim = shim
 
-    def save(self, folder: str, prefix: str | None = None) -> list[str]:
-        name = f"{prefix}-vocab.json" if prefix else "vocab.json"
-        path = Path(folder) / name
+    def save(self, folder: str, name: str | None = None, *, prefix: str | None = None) -> list[str]:
+        # HF transformers fast tokenizer shims (qwen2, bart, bloom, …) call
+        # this with name=<filename_prefix>; the upstream tokenizers .pyi
+        # documents the same arg as ``prefix``. Accept both spellings so the
+        # shim works regardless of which name the caller used.
+        if prefix is not None:
+            if name is not None and name != prefix:
+                raise TypeError("save() got both 'name' and 'prefix'; pass only one")
+            name = prefix
+        filename = f"{name}-vocab.json" if name else "vocab.json"
+        path = Path(folder) / filename
         vocab = self._shim.get_vocab()
         path.write_text(json.dumps(vocab, ensure_ascii=False), encoding="utf-8")
         return [str(path)]

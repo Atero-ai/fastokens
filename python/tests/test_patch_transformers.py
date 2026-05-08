@@ -55,3 +55,34 @@ def test_unpatch_restores_backend():
     assert not isinstance(tok._tokenizer, _TokenizerShim), (
         "backend should be original tokenizers.Tokenizer after unpatch"
     )
+
+
+def test_save_pretrained_with_patched_tokenizer(tmp_path):
+    """save_pretrained must work under the patched backend.
+
+    HF fast tokenizers (e.g. Qwen2/Qwen3 family) call
+    ``self._tokenizer.model.save(save_directory, name=filename_prefix)``
+    inside ``save_vocabulary``. Regression for an earlier _ModelStub.save
+    signature that only accepted ``prefix=``.
+    """
+    import fastokens
+
+    fastokens.patch_transformers()
+
+    tok = transformers.AutoTokenizer.from_pretrained(MODEL)
+    tok.save_pretrained(str(tmp_path))
+
+
+def test_model_stub_save_accepts_both_kwargs(tmp_path):
+    """_ModelStub.save must accept both ``name=`` (transformers callsite) and
+    ``prefix=`` (upstream tokenizers .pyi spelling)."""
+    from fastokens._compat import _ModelStub, _TokenizerShim  # noqa: PLC0415
+
+    shim = _TokenizerShim.__new__(_TokenizerShim)
+    shim.get_vocab = lambda: {"a": 1, "b": 2}  # type: ignore[attr-defined]
+    stub = _ModelStub(shim)
+
+    out_name = stub.save(str(tmp_path), name="qwen")
+    out_prefix = stub.save(str(tmp_path), prefix="qwen")
+    out_positional = stub.save(str(tmp_path), "qwen")
+    assert out_name == out_prefix == out_positional

@@ -59,9 +59,6 @@ pub enum Error {
     #[error("model error: {0}")]
     Model(String),
 
-    #[error("decode error: {0}")]
-    Decode(String),
-
     #[error("invalid model identifier: {0}")]
     InvalidIdentifier(String),
 }
@@ -315,10 +312,13 @@ impl Tokenizer {
             {
                 continue;
             }
-            let token_str = self
-                .id_to_token(id)
-                .ok_or_else(|| Error::Decode(format!("unknown token ID: {id}")))?;
-            tokens.push(token_str.to_string());
+            // Match HuggingFace behavior: silently skip unknown IDs (e.g.
+            // models like Qwen3-0.6B-FP8 emit IDs in the gap between
+            // tokenizer.json's vocab and the embedding matrix). Erroring
+            // here would kill streaming generation on a single bad token.
+            if let Some(token_str) = self.id_to_token(id) {
+                tokens.push(token_str.to_string());
+            }
         }
 
         match &self.decoder {
@@ -1650,11 +1650,29 @@ mod tests {
         );
     }
 
-    /// decode of an unknown ID returns an error rather than panicking.
+    /// decode of an unknown ID silently skips it, matching HuggingFace.
     #[test]
-    fn decode_unknown_id_returns_error() {
+    fn decode_unknown_id_is_skipped() {
         let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
-        assert!(tok.decode(&[u32::MAX], false).is_err());
+        assert_eq!(tok.decode(&[u32::MAX], false).unwrap(), "");
+    }
+
+    /// decode interleaves valid tokens with unknown IDs, dropping only the bad ones.
+    #[test]
+    fn decode_mixed_valid_and_unknown_ids() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        let valid = tok.encode_with_special_tokens("hello", false).unwrap();
+        let mut mixed = valid.clone();
+        mixed.push(u32::MAX);
+        mixed.extend(tok.encode_with_special_tokens(" world", false).unwrap());
+        let expected = tok.decode(&valid, false).unwrap()
+            + &tok
+                .decode(
+                    &tok.encode_with_special_tokens(" world", false).unwrap(),
+                    false,
+                )
+                .unwrap();
+        assert_eq!(tok.decode(&mixed, false).unwrap(), expected);
     }
 
     /// id_to_token / token_to_id round-trip for sampled IDs across all models.
@@ -1867,6 +1885,27 @@ mod tests {
             }
         }
         assert_eq!(chunks.concat(), text);
+    }
+
+    /// Streaming decode silently skips unknown IDs instead of erroring, so
+    /// a single OOV token (e.g. emitted in the gap between tokenizer vocab
+    /// and embedding matrix on some Qwen FP8 checkpoints) doesn't kill the
+    /// whole generation. Matches HuggingFace DecodeStream behavior.
+    #[test]
+    fn decode_stream_unknown_id_does_not_error() {
+        let tok = stream_tok();
+        let mut buf = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let result = super::decode_stream_step(
+            &tok,
+            vec![u32::MAX],
+            false,
+            &mut buf,
+            &mut prefix,
+            &mut prefix_index,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]

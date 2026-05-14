@@ -121,7 +121,15 @@ def unpatch_transformers() -> None:
     if "TokenizersBackend.from_pretrained" in _originals:
         from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
-        TokenizersBackend.from_pretrained = _originals["TokenizersBackend.from_pretrained"]
+        # `from_pretrained` is inherited from `PreTrainedTokenizerBase`, not
+        # defined on `TokenizersBackend`. The value captured during patch
+        # via attribute access is a bound `method`, not a classmethod
+        # descriptor — assigning it back installs a stray attribute in
+        # `TokenizersBackend.__dict__` that shadows the inherited
+        # classmethod and breaks `cls` polymorphism for subclasses.
+        # Removing our patch attribute restores plain inheritance.
+        if "from_pretrained" in TokenizersBackend.__dict__:
+            del TokenizersBackend.from_pretrained
 
     # v4 path
     if "tokenization_utils_fast" in _originals:

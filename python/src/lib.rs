@@ -331,6 +331,15 @@ struct PaddingParams {
     pad_to_multiple_of: Option<usize>,
 }
 
+fn build_encoding(ids: Vec<u32>, pad: Option<&PaddingParams>, target: usize) -> PyEncoding {
+    let n = ids.len();
+    let mut enc = PyEncoding::make(ids, vec![1u32; n]);
+    if let Some(p) = pad {
+        enc.pad(target, &p.direction, p.pad_id, p.pad_type_id, &p.pad_token);
+    }
+    enc
+}
+
 // ---------------------------------------------------------------------------
 // PyPostProcessor
 // ---------------------------------------------------------------------------
@@ -383,31 +392,6 @@ impl TokenizerState {
             ids.drain(..ids.len() - t.max_length);
         } else {
             ids.truncate(t.max_length);
-        }
-    }
-
-    /// Pad `ids` to `target` length and return the attention mask.
-    fn pad_to(&self, ids: &mut Vec<u32>, target: usize) -> Vec<u32> {
-        let n_real = ids.len();
-        if target <= n_real {
-            return vec![1u32; n_real];
-        }
-        let Some(ref p) = self.pad else {
-            return vec![1u32; n_real];
-        };
-        let deficit = target - n_real;
-        if p.direction == "left" {
-            let mut new_ids = vec![p.pad_id; deficit];
-            new_ids.extend_from_slice(ids);
-            *ids = new_ids;
-            let mut mask = vec![0u32; deficit];
-            mask.extend(vec![1u32; n_real]);
-            mask
-        } else {
-            ids.extend(vec![p.pad_id; deficit]);
-            let mut mask = vec![1u32; n_real];
-            mask.extend(vec![0u32; deficit]);
-            mask
         }
     }
 
@@ -656,9 +640,8 @@ impl PyTokenizer {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         state.do_truncate(&mut ids);
         let target = state.single_pad_target(ids.len());
-        let mask = state.pad_to(&mut ids, target);
 
-        Py::new(py, PyEncoding::make(ids, mask))
+        Py::new(py, build_encoding(ids, state.pad.as_ref(), target))
     }
 
     /// Encode a batch of inputs in parallel.
@@ -700,12 +683,9 @@ impl PyTokenizer {
 
         batch
             .into_iter()
-            .map(|mut ids| {
-                let mask = match pad_target {
-                    Some(target) => state.pad_to(&mut ids, target),
-                    None => vec![1u32; ids.len()],
-                };
-                Py::new(py, PyEncoding::make(ids, mask))
+            .map(|ids| {
+                let target = pad_target.unwrap_or(ids.len());
+                Py::new(py, build_encoding(ids, state.pad.as_ref(), target))
             })
             .collect()
     }
@@ -830,38 +810,40 @@ mod tests {
         );
     }
 
-    /// `encode_batch` goes through `pad_to`, which only extends `ids` and
-    /// returns the attention mask.  `PyEncoding::make` is then called with the
-    /// padded `ids`, and it initialises `type_ids` to all-zeros — so
-    /// `pad_type_id` is silently ignored.
-    ///
-    /// This test reproduces that exact code-path and asserts the *correct*
-    /// behaviour; it currently **fails**, documenting the bug.
+    /// The tokenizer encode paths build returned encodings through the same
+    /// padding owner as `PyEncoding::pad`, preserving `pad_type_id` metadata.
     #[test]
     fn encode_batch_pad_type_id_applied_to_type_ids() {
-        let pad_id = 0u32;
-        let pad_type_id = 1u32;
-        let n_real = 3usize;
-        let target = 5usize;
-        let deficit = target - n_real;
+        let pad = PaddingParams {
+            direction: "right".to_string(),
+            pad_id: 0,
+            pad_type_id: 1,
+            pad_token: "[PAD]".to_string(),
+            length: None,
+            pad_to_multiple_of: None,
+        };
+        let enc = build_encoding(vec![10u32, 20, 30], Some(&pad), 5);
 
-        // Reproduce what encode_batch + pad_to does today:
-        //   1. encode → ids (3 real tokens)
-        //   2. pad_to: extend ids with pad_id, build attention mask
-        //   3. PyEncoding::make(ids, mask)   ← type_ids comes from here as all-zeros
-        let mut ids = vec![10u32, 20, 30];
-        ids.extend(vec![pad_id; deficit]);
-        let mut mask = vec![1u32; n_real];
-        mask.extend(vec![0u32; deficit]);
-        let enc = PyEncoding::make(ids, mask);
+        assert_eq!(enc.ids, vec![10u32, 20, 30, 0, 0]);
+        assert_eq!(enc.attention_mask, vec![1u32, 1, 1, 0, 0]);
+        assert_eq!(enc.type_ids, vec![0u32, 0, 0, 1, 1]);
+    }
 
-        // The padded positions should carry pad_type_id — but pad_to never
-        // passes pad_type_id into PyEncoding::make, so they are 0.
-        assert_eq!(
-            enc.type_ids[n_real..].to_vec(),
-            vec![pad_type_id; deficit],
-            "encode_batch must propagate pad_type_id into type_ids of padded positions"
-        );
+    #[test]
+    fn build_encoding_left_padding_applies_pad_type_id() {
+        let pad = PaddingParams {
+            direction: "left".to_string(),
+            pad_id: 0,
+            pad_type_id: 7,
+            pad_token: "[PAD]".to_string(),
+            length: None,
+            pad_to_multiple_of: None,
+        };
+        let enc = build_encoding(vec![10u32, 20, 30], Some(&pad), 5);
+
+        assert_eq!(enc.ids, vec![0u32, 0, 10, 20, 30]);
+        assert_eq!(enc.attention_mask, vec![0u32, 0, 1, 1, 1]);
+        assert_eq!(enc.type_ids, vec![7u32, 7, 0, 0, 0]);
     }
 }
 

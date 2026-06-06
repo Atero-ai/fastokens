@@ -1830,6 +1830,7 @@ mod tests {
         }
     }
 
+    // Qwen2-VL's image token is located in the tokenizer_config.json's added_token_configs
     #[test]
     fn added_tokens_qwen2_vl_image_pad() {
         let model = "Qwen/Qwen2-VL-2B-Instruct";

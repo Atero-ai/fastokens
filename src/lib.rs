@@ -9,7 +9,7 @@ pub mod pre_tokenizers;
 pub mod tiktoken;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     path::Path,
     sync::{Arc, Mutex},
@@ -23,7 +23,7 @@ pub use self::{
     json_structs::{
         AddedTokenConfig, DecoderConfig, DecoderKind, ModelConfig, ModelKind, NormalizerConfig,
         NormalizerKind, PostProcessorConfig, PostProcessorKind, PreTokenizerConfig,
-        PreTokenizerKind, TokenizerJson,
+        PreTokenizerKind, TokenizerConfig, TokenizerJson,
     },
     models::Model,
     normalizers::{Nfc, Normalizer, Replace},
@@ -81,9 +81,25 @@ mod hf_hub_support {
         let api = make_api(token)?;
         let repo = api.model(model.to_string());
         let json_path = repo.get("tokenizer.json")?;
-        let raw = fs::read_to_string(json_path)?;
+        let raw = fs::read_to_string(&json_path)?;
         let json: TokenizerJson = serde_json::from_str(&raw)?;
-        Tokenizer::build_with_options(json, options)
+        // Some models (e.g. Qwen2-VL) declare added tokens only in
+        // `tokenizer_config.json`; fetch it too when present.
+        let config_path = json_path.with_file_name("tokenizer_config.json");
+        let tokenizer_config = if config_path.exists() {
+            Some(serde_json::from_str(&fs::read_to_string(config_path)?)?)
+        } else if repo
+            .info()?
+            .siblings
+            .iter()
+            .any(|sibling| sibling.rfilename == "tokenizer_config.json")
+        {
+            let config_path = repo.get("tokenizer_config.json")?;
+            Some(serde_json::from_str(&fs::read_to_string(config_path)?)?)
+        } else {
+            None
+        };
+        Tokenizer::build_with_options(json, tokenizer_config, options)
     }
 
     /// Used by the Python layer to fetch `tokenizer.json` from the HuggingFace Hub and
@@ -323,10 +339,25 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Build the pipeline steps from a parsed JSON config.
     fn build(json: TokenizerJson) -> Result<Self, Error> {
-        Self::build_with_options(json, TokenizerOptions::default())
+        Self::build_with_options(json, None, TokenizerOptions::default())
     }
 
-    fn build_with_options(json: TokenizerJson, options: TokenizerOptions) -> Result<Self, Error> {
+    fn build_with_options(
+        mut json: TokenizerJson,
+        tokenizer_config: Option<TokenizerConfig>,
+        options: TokenizerOptions,
+    ) -> Result<Self, Error> {
+        // Merge added tokens declared only in `tokenizer_config.json`
+        // (`added_tokens_decoder`) — e.g. Qwen2-VL's `<|image_pad|>`, which is
+        // absent from `tokenizer.json`'s `added_tokens` array.
+        if let Some(tokenizer_config) = tokenizer_config {
+            Self::merge_added_tokens(
+                &mut json.added_tokens,
+                tokenizer_config
+                    .added_token_configs()
+                    .map_err(Error::Model)?,
+            )?;
+        }
         let added_tokens = AddedTokens::from_configs(&json.added_tokens).map_err(Error::Model)?;
         let normalizer = json.normalizer.map(Normalizer::from_config).transpose()?;
         let pre_tokenizer = json
@@ -401,13 +432,19 @@ impl Tokenizer {
     /// Create a tokenizer from a raw JSON value for `tokenizer.json` with construction options.
     pub fn from_json_with_options(json: Value, options: TokenizerOptions) -> Result<Self, Error> {
         let json: TokenizerJson = serde_json::from_value(json)?;
-        Self::build_with_options(json, options)
+        Self::build_with_options(json, None, options)
     }
 
     /// Create a tokenizer from a `tokenizer.json` file.
     pub fn from_file(path: &Path) -> Result<Self, Error> {
         let json: TokenizerJson = serde_json::from_str(&fs::read_to_string(path)?)?;
-        Self::build(json)
+        let config_path = path.with_file_name("tokenizer_config.json");
+        let tokenizer_config = if config_path.exists() {
+            Some(serde_json::from_str(&fs::read_to_string(config_path)?)?)
+        } else {
+            None
+        };
+        Self::build_with_options(json, tokenizer_config, TokenizerOptions::default())
     }
 
     /// Create a tokenizer from tiktoken mergeable ranks (`token_bytes -> rank`).
@@ -491,7 +528,13 @@ impl Tokenizer {
     /// Create a tokenizer from a `tokenizer.json` file with construction options.
     pub fn from_file_with_options(path: &Path, options: TokenizerOptions) -> Result<Self, Error> {
         let json: TokenizerJson = serde_json::from_str(&fs::read_to_string(path)?)?;
-        Self::build_with_options(json, options)
+        let config_path = path.with_file_name("tokenizer_config.json");
+        let tokenizer_config = if config_path.exists() {
+            Some(serde_json::from_str(&fs::read_to_string(config_path)?)?)
+        } else {
+            None
+        };
+        Self::build_with_options(json, tokenizer_config, options)
     }
 
     /// Download `tokenizer.json` from HuggingFace Hub for the given model (e.g.
@@ -540,6 +583,54 @@ impl Tokenizer {
     /// Return the normalizer, if any.
     pub fn normalizer(&self) -> Option<&Normalizer> {
         self.normalizer.as_ref()
+    }
+
+    fn merge_added_tokens(
+        added_tokens: &mut Vec<AddedTokenConfig>,
+        extra_tokens: Vec<AddedTokenConfig>,
+    ) -> Result<(), Error> {
+        let mut ids = HashMap::with_capacity(added_tokens.len());
+        let mut contents = HashMap::with_capacity(added_tokens.len());
+        for (index, token) in added_tokens.iter().enumerate() {
+            ids.insert(token.id, index);
+            contents.insert(token.content.clone(), token.id);
+        }
+
+        for token in extra_tokens {
+            match (
+                ids.get(&token.id).copied(),
+                contents.get(&token.content).copied(),
+            ) {
+                (Some(index), Some(existing_id)) if existing_id == token.id => {
+                    if added_tokens[index] != token {
+                        return Err(Error::Model(format!(
+                            "conflicting added token metadata for id {} ({:?})",
+                            token.id, token.content
+                        )));
+                    }
+                }
+                (Some(index), _) => {
+                    return Err(Error::Model(format!(
+                        "added token id {} maps to both {:?} and {:?}",
+                        token.id, added_tokens[index].content, token.content
+                    )));
+                }
+                (_, Some(existing_id)) => {
+                    return Err(Error::Model(format!(
+                        "added token {:?} maps to both ids {} and {}",
+                        token.content, existing_id, token.id
+                    )));
+                }
+                (None, None) => {
+                    let index = added_tokens.len();
+                    ids.insert(token.id, index);
+                    contents.insert(token.content.clone(), token.id);
+                    added_tokens.push(token);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Return the pre-tokenizer, if any.
@@ -1224,6 +1315,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_file_merges_added_tokens_from_tokenizer_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "fastokens-added-tokens-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let tokenizer_json = serde_json::json!({
+            "added_tokens": [
+                {
+                    "id": 10,
+                    "content": "<|im_start|>",
+                    "special": true
+                },
+                {
+                    "id": 11,
+                    "content": "<|im_end|>",
+                    "special": true
+                }
+            ],
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "a": 0,
+                    "b": 1,
+                    "ab": 2
+                },
+                "merges": ["a b"]
+            }
+        });
+        let tokenizer_config_json = serde_json::json!({
+            "added_tokens_decoder": {
+                "10": {
+                    "content": "<|im_start|>",
+                    "special": true
+                },
+                "11": {
+                    "content": "<|im_end|>",
+                    "special": true
+                },
+                "12": {
+                    "content": "<|vision_start|>",
+                    "special": true
+                },
+                "13": {
+                    "content": "<|image_pad|>",
+                    "special": true
+                },
+                "14": {
+                    "content": "<|vision_end|>",
+                    "special": true
+                }
+            }
+        });
+
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::to_vec(&tokenizer_config_json).unwrap(),
+        )
+        .unwrap();
+
+        let tok = Tokenizer::from_file(&dir.join("tokenizer.json")).unwrap();
+        assert_eq!(tok.token_to_id("<|image_pad|>"), Some(13));
+        assert_eq!(tok.id_to_token(13), Some("<|image_pad|>"));
+        assert_eq!(
+            tok.encode("<|vision_start|><|image_pad|><|vision_end|>")
+                .unwrap(),
+            vec![12, 13, 14]
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // ── Correctness tests against HuggingFace tokenizers ─────────────
 
     /// Comprehensive corpus of inputs designed to exercise tokenizer edge
@@ -1655,6 +1828,29 @@ mod tests {
             // Round-trip: the ID must decode back to the same string.
             assert_eq!(tok.id_to_token(id.unwrap()), Some(*token));
         }
+    }
+
+    #[test]
+    fn added_tokens_qwen2_vl_image_pad() {
+        let model = "Qwen/Qwen2-VL-2B-Instruct";
+        let api = make_api(None).unwrap();
+        let repo = api.model(model.to_string());
+        let tokenizer_config_path = repo.get("tokenizer_config.json").unwrap();
+        let tokenizer_config: TokenizerConfig =
+            serde_json::from_str(&fs::read_to_string(tokenizer_config_path).unwrap()).unwrap();
+
+        let tok = Tokenizer::from_model(model).unwrap();
+        let image_pad_id = tokenizer_config
+            .added_token_configs()
+            .unwrap()
+            .into_iter()
+            .find(|token| token.content == "<|image_pad|>")
+            .map(|token| token.id)
+            .expect("<|image_pad|> should exist in tokenizer_config.json");
+
+        assert_eq!(tok.token_to_id("<|image_pad|>"), Some(image_pad_id));
+        assert_eq!(tok.id_to_token(image_pad_id), Some("<|image_pad|>"));
+        assert_eq!(tok.decode(&[image_pad_id], false).unwrap(), "<|image_pad|>");
     }
 
     /// Qwen3-VL vision tokens — the exact text that triggered:

@@ -7,7 +7,7 @@ use strum::EnumDiscriminants;
 use crate::{models, pre_tokenizers};
 
 /// An entry in the `added_tokens` array of `tokenizer.json`.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AddedTokenConfig {
     /// Token ID.
     pub id: u32,
@@ -31,6 +31,38 @@ pub struct AddedTokenConfig {
     /// post-processing.
     #[serde(default)]
     pub special: bool,
+}
+
+/// Parsed `tokenizer_config.json`.
+#[derive(Debug, Deserialize)]
+pub struct TokenizerConfig {
+    #[serde(default)]
+    pub added_tokens_decoder: HashMap<String, Value>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+impl TokenizerConfig {
+    /// Convert `added_tokens_decoder` into the same shape as `tokenizer.json`'s
+    /// `added_tokens` array.
+    pub fn added_token_configs(&self) -> Result<Vec<AddedTokenConfig>, String> {
+        let mut entries = Vec::with_capacity(self.added_tokens_decoder.len());
+        for (id, value) in &self.added_tokens_decoder {
+            let id = id
+                .parse::<u32>()
+                .map_err(|e| format!("invalid added token id {id:?}: {e}"))?;
+            let mut value = value.clone();
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| format!("added token {id} is not a JSON object"))?;
+            object.insert("id".into(), Value::from(id));
+            let entry: AddedTokenConfig = serde_json::from_value(value)
+                .map_err(|e| format!("failed to parse added token {id}: {e}"))?;
+            entries.push(entry);
+        }
+        entries.sort_by_key(|entry| entry.id);
+        Ok(entries)
+    }
 }
 
 /// Parsed `tokenizer.json`.

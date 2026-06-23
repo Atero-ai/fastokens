@@ -19,12 +19,16 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 
+[features]
+default = ["hf-hub"]
+hf-hub = ["dep:hf-hub"]
+
 [dependencies]
 daachorse = "1.0.0"
 fancy-regex = "0.17.0"
 memchr = "2"
 pcre2 = "0.2"
-hf-hub = { version = "0.4.3", default-features = false, features = ["rustls-tls", "ureq"] }
+hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["rustls-tls", "ureq"] }
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -38,3 +42,23 @@ clap = { version = "4.5.58", features = ["derive"] }
 csv = "1.4.0"
 indicatif = "0.18.4"
 tokenizers = { version = "0.22.2", features = ["http"] }
+
+[[example]]
+name = "get_step_kinds"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "print_pipeline"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "profile_sample"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "profile_stages"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "simple_bench"
+required-features = ["hf-hub"]

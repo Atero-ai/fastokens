@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fancy_regex::Regex;
+use memchr::{memchr, memchr2};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,8 +29,52 @@ struct SplitCache {
 /// Minimum shared prefix length (bytes) before incremental re-use kicks in.
 const INCREMENTAL_MIN_PREFIX: usize = 4096;
 
-/// Wrapper around a JIT-compiled PCRE2 regex for the Llama-3 pattern.
-struct Pcre2Regex(pcre2::bytes::Regex);
+/// PCRE2 resource limits applied while compiling Split regexes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pcre2Limits {
+    pub match_limit: Option<u32>,
+    pub depth_limit: Option<u32>,
+    /// Heap limit in KiB, matching PCRE2's `(*LIMIT_HEAP=...)` units.
+    pub heap_limit: Option<u32>,
+    pub max_jit_stack_size: Option<usize>,
+}
+
+impl Pcre2Limits {
+    fn has_any(self) -> bool {
+        self.match_limit.is_some()
+            || self.depth_limit.is_some()
+            || self.heap_limit.is_some()
+            || self.max_jit_stack_size.is_some()
+    }
+
+    fn apply_to_source(self, source: &str) -> std::string::String {
+        if self.match_limit.is_none() && self.depth_limit.is_none() && self.heap_limit.is_none() {
+            return source.to_string();
+        }
+
+        let mut prefixed = String::new();
+        if let Some(limit) = self.heap_limit {
+            prefixed.push_str(&format!("(*LIMIT_HEAP={limit})"));
+        }
+        if let Some(limit) = self.match_limit {
+            prefixed.push_str(&format!("(*LIMIT_MATCH={limit})"));
+        }
+        if let Some(limit) = self.depth_limit {
+            prefixed.push_str(&format!("(*LIMIT_DEPTH={limit})"));
+        }
+        prefixed.push_str(source);
+        prefixed
+    }
+}
+
+/// Wrapper around a JIT-compiled PCRE2 regex for a PCRE2-compatible Split
+/// pattern. `source` is retained so [`Clone`] can recompile (the JIT regex is
+/// not itself cloneable).
+struct Pcre2Regex {
+    regex: pcre2::bytes::Regex,
+    source: std::string::String,
+    max_jit_stack_size: Option<usize>,
+}
 
 // Safety: PCRE2 JIT-compiled regexes are thread-safe for matching.
 // Each thread uses independent match data internally via pcre2 crate.
@@ -44,15 +89,21 @@ impl std::fmt::Debug for Pcre2Regex {
 
 impl Clone for Pcre2Regex {
     fn clone(&self) -> Self {
-        // Re-compile for independent match state.
-        Self(
-            pcre2::bytes::RegexBuilder::new()
-                .utf(true)
-                .ucp(true)
-                .jit_if_available(true)
-                .build(self.0.as_str())
-                .expect("re-compile PCRE2 regex"),
-        )
+        let mut builder = pcre2::bytes::RegexBuilder::new();
+        builder
+            .utf(true)
+            .ucp(true)
+            .jit_if_available(true)
+            .max_jit_stack_size(self.max_jit_stack_size);
+        Self {
+            // Infallible in practice: `source` compiled successfully when this
+            // instance was first built, and `Clone` cannot surface an error.
+            regex: builder
+                .build(&self.source)
+                .expect("PCRE2 source recompiles: it already compiled once"),
+            source: self.source.clone(),
+            max_jit_stack_size: self.max_jit_stack_size,
+        }
     }
 }
 
@@ -119,13 +170,13 @@ pub enum SplitBehavior {
 }
 
 /// Raw deserialization helper for [`Split`].
-#[derive(Deserialize)]
-struct SplitRaw {
-    pattern: Pattern,
+#[derive(Clone, Debug, Deserialize)]
+pub struct SplitConfig {
+    pub pattern: Pattern,
     #[serde(default)]
-    behavior: SplitBehavior,
+    pub behavior: SplitBehavior,
     #[serde(default)]
-    invert: bool,
+    pub invert: bool,
 }
 
 /// Monotonic counter for unique Split instance IDs.
@@ -139,7 +190,7 @@ static SPLIT_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 ///
 /// [`PreTokenizerConfig::Split`]: crate::PreTokenizerConfig::Split
 #[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "SplitRaw")]
+#[serde(try_from = "SplitConfig")]
 pub struct Split {
     /// Unique identity for cache invalidation across different Split instances.
     #[serde(skip)]
@@ -161,21 +212,96 @@ pub struct Split {
 
 /// Compile PCRE2 JIT regexes from `source`, returning `None` if PCRE2 cannot
 /// handle the pattern (e.g. unsupported syntax).
-fn try_compile_pcre2_regexes(source: &str, n: usize) -> Option<Vec<Pcre2Regex>> {
-    if source.contains("&&") {
-        return None;
+fn try_compile_pcre2_regexes(
+    source: &str,
+    n: usize,
+    limits: Pcre2Limits,
+) -> Result<Option<Vec<Pcre2Regex>>, Error> {
+    if has_class_intersection(source) {
+        if limits.has_any() {
+            return Err(Error::Unsupported(
+                "PCRE2 limits require a PCRE2-compatible regex pattern".into(),
+            ));
+        }
+        return Ok(None);
     }
+    let source = limits.apply_to_source(source);
     let mut regexes = Vec::with_capacity(n);
     for _ in 0..n {
-        let re = pcre2::bytes::RegexBuilder::new()
+        let mut builder = pcre2::bytes::RegexBuilder::new();
+        builder
             .utf(true)
             .ucp(true)
             .jit_if_available(true)
-            .build(source)
-            .ok()?;
-        regexes.push(Pcre2Regex(re));
+            .max_jit_stack_size(limits.max_jit_stack_size);
+        let re = match builder.build(&source) {
+            Ok(re) => re,
+            Err(e) if limits.has_any() => {
+                return Err(Error::Unsupported(format!(
+                    "PCRE2 limits require a PCRE2-compatible regex pattern: {e}"
+                )));
+            }
+            Err(_) => return Ok(None),
+        };
+        regexes.push(Pcre2Regex {
+            regex: re,
+            source: source.clone(),
+            max_jit_stack_size: limits.max_jit_stack_size,
+        });
     }
-    Some(regexes)
+    Ok(Some(regexes))
+}
+
+fn has_class_intersection(source: &str) -> bool {
+    // && inside a regex character class is the fancy-regex set-intersection syntax, e.g. [a&&b],
+    // which PCRE2 does not support.
+    let bytes = source.as_bytes();
+
+    if memchr::memmem::find(bytes, b"&&").is_none() {
+        return false;
+    }
+
+    let mut search_start = 0;
+    'classes: while let Some(open_rel) = memchr(b'[', &bytes[search_start..]) {
+        let open = search_start + open_rel;
+        if is_escaped(bytes, open) {
+            search_start = open + 1;
+            continue;
+        }
+
+        let mut pos = open + 1;
+        loop {
+            let Some(rel) = memchr2(b'&', b']', &bytes[pos..]) else {
+                return false;
+            };
+            let idx = pos + rel;
+            if is_escaped(bytes, idx) {
+                pos = idx + 1;
+                continue;
+            }
+
+            match bytes[idx] {
+                b'&' if bytes.get(idx + 1) == Some(&b'&') => return true,
+                b']' if idx > open + 1 => {
+                    search_start = idx + 1;
+                    continue 'classes;
+                }
+                _ => pos = idx + 1,
+            }
+        }
+    }
+
+    false
+}
+
+fn is_escaped(bytes: &[u8], pos: usize) -> bool {
+    let mut slash_count = 0;
+    let mut i = pos;
+    while i > 0 && bytes[i - 1] == b'\\' {
+        slash_count += 1;
+        i -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 /// Compile `n` independent copies of a regex from `source`.
@@ -187,37 +313,24 @@ fn compile_regexes(source: &str, n: usize) -> Result<Vec<Regex>, Error> {
     Ok(regexes)
 }
 
-impl TryFrom<SplitRaw> for Split {
+impl TryFrom<SplitConfig> for Split {
     type Error = Error;
 
-    fn try_from(raw: SplitRaw) -> Result<Self, Error> {
-        let source = raw.pattern.source();
-        let scan = scan::recognize(&source);
-        let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
-        let regexes = compile_regexes(&source, max_parallel())?;
-        Ok(Self {
-            id: SPLIT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            regexes,
-            behavior: raw.behavior,
-            invert: raw.invert,
-            pcre2_regexes,
-            scan,
-        })
+    fn try_from(raw: SplitConfig) -> Result<Self, Error> {
+        Self::from_split_config_with_limits(raw, Pcre2Limits::default())
     }
 }
 
 impl Split {
-    /// Build a [`Split`] from raw JSON fields.
-    ///
-    /// `pattern` must be a JSON object with either a `"String"` key (literal,
-    /// will be regex-escaped) or a `"Regex"` key (used as-is).
-    pub fn from_config(pattern: &Value, behavior: &str, invert: bool) -> Result<Self, Error> {
-        let pattern: Pattern = serde_json::from_value(pattern.clone())?;
-        let source = pattern.source();
+    fn from_parts(
+        source: std::string::String,
+        behavior: SplitBehavior,
+        invert: bool,
+        limits: Pcre2Limits,
+    ) -> Result<Self, Error> {
         let scan = scan::recognize(&source);
         let regexes = compile_regexes(&source, max_parallel())?;
-        let behavior: SplitBehavior = serde_json::from_value(Value::String(behavior.to_string()))?;
-        let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
+        let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel(), limits)?;
         Ok(Self {
             id: SPLIT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             regexes,
@@ -234,6 +347,41 @@ impl Split {
     pub fn scan_kind(&self) -> Option<ScanKind> {
         let kind = self.scan?;
         (self.behavior == SplitBehavior::Isolated && !self.invert).then_some(kind)
+    }
+
+    /// Build a [`Split`] from a deserialized [`SplitConfig`] with explicit PCRE2
+    /// resource limits.
+    pub fn from_split_config_with_limits(
+        config: SplitConfig,
+        limits: Pcre2Limits,
+    ) -> Result<Self, Error> {
+        Self::from_parts(
+            config.pattern.source(),
+            config.behavior,
+            config.invert,
+            limits,
+        )
+    }
+
+    /// Build a [`Split`] from raw JSON fields.
+    ///
+    /// `pattern` must be a JSON object with either a `"String"` key (literal,
+    /// will be regex-escaped) or a `"Regex"` key (used as-is).
+    pub fn from_config(pattern: &Value, behavior: &str, invert: bool) -> Result<Self, Error> {
+        Self::from_config_with_limits(pattern, behavior, invert, Pcre2Limits::default())
+    }
+
+    /// [`Self::from_config`] with explicit PCRE2 resource limits.
+    pub fn from_config_with_limits(
+        pattern: &Value,
+        behavior: &str,
+        invert: bool,
+        limits: Pcre2Limits,
+    ) -> Result<Self, Error> {
+        let pattern: Pattern = serde_json::from_value(pattern.clone())?;
+        let source = pattern.source();
+        let behavior: SplitBehavior = serde_json::from_value(Value::String(behavior.to_string()))?;
+        Self::from_parts(source, behavior, invert, limits)
     }
 
     /// Refine the splits of a [`PreTokenizedString`] in place.
@@ -451,7 +599,7 @@ impl Split {
                 if p >= bytes.len() {
                     return Ok(None);
                 }
-                match regex.0.find_at(bytes, p) {
+                match regex.regex.find_at(bytes, p) {
                     Ok(Some(m)) => {
                         if m.start() == m.end() {
                             p = m.end() + 1;
@@ -847,7 +995,7 @@ fn find_matches_pcre2(
     let bytes = input.as_bytes();
     let mut pos = 0;
     while pos < bytes.len() {
-        match regex.0.find_at(bytes, pos) {
+        match regex.regex.find_at(bytes, pos) {
             Ok(Some(m)) => {
                 if m.start() == m.end() {
                     pos = m.end() + 1;
@@ -1029,6 +1177,61 @@ mod tests {
     fn error_unknown_behavior() {
         let err = Split::from_config(&json!({"String": "-"}), "Foobar", false).unwrap_err();
         assert!(matches!(err, Error::Json(_)));
+    }
+
+    #[test]
+    fn pcre2_match_limit_is_enforced() {
+        let split = Split::from_config_with_limits(
+            &json!({"Regex": "^(a+)+$"}),
+            "Isolated",
+            false,
+            Pcre2Limits {
+                match_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = split.split("aaaaaaaaaaaaaaaa!").unwrap_err();
+        assert!(
+            err.to_string().contains("match limit"),
+            "expected match limit error, got {err}"
+        );
+    }
+
+    #[test]
+    fn pcre2_limits_require_pcre2_compatible_pattern() {
+        let err = Split::from_config_with_limits(
+            &json!({"Regex": "[a&&b]"}),
+            "Isolated",
+            false,
+            Pcre2Limits {
+                match_limit: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("PCRE2 limits require"),
+            "expected PCRE2 compatibility error, got {err}"
+        );
+    }
+
+    #[test]
+    fn pcre2_limits_allow_literal_ampersands() {
+        let split = Split::from_config_with_limits(
+            &json!({"String": "&&"}),
+            "Isolated",
+            false,
+            Pcre2Limits {
+                match_limit: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(split.split("a&&b").unwrap(), vec!["a", "&&", "b"]);
     }
 
     // ── Real-world tokenizer patterns ──────────────────────

@@ -127,6 +127,25 @@ results are bit-identical to tokenizing from scratch. On a ~1M-token shared
 prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
 reuses the whole encoding.
 
+### PCRE2 resource limits
+
+PCRE2 resource limits can be set when constructing a tokenizer to guard against
+pathological regex/input combinations in `tokenizer.json`:
+
+```python
+from fastokens._native import Tokenizer
+
+tokenizer = Tokenizer.from_model(
+    "deepseek-ai/DeepSeek-V3.2",
+    pcre2_match_limit=1_000_000,
+)
+```
+
+If a limit is reached during pre-tokenization, encoding returns an error instead
+of continuing an expensive regex match. The same keyword arguments are accepted
+by `Tokenizer(...)`, `Tokenizer.from_file(...)`, `Tokenizer.from_json_str(...)`,
+and `fastokens.patch_transformers(...)`.
+
 ### Dynamo usage
 
 `fastokens` is integrated with NVIDIA Dynamo's frontend, and can be used by passing the flag `--tokenizer fastokens` to the latest version (either build from source or wait for the official release, coming in the next few days).

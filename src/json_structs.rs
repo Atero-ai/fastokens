@@ -116,7 +116,7 @@ pub enum PreTokenizerConfig {
     ByteLevel(pre_tokenizers::ByteLevel),
     Whitespace,
     WhitespaceSplit,
-    Split(pre_tokenizers::Split),
+    Split(pre_tokenizers::SplitConfig),
     Punctuation {
         #[serde(default)]
         behavior: String,

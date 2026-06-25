@@ -72,16 +72,41 @@ class Encoding:
 class Tokenizer:
     """An LLM tokenizer backed by ``tokenizer.json``."""
 
-    def __new__(cls, model: str) -> "Tokenizer": ...
+    def __new__(
+        cls,
+        model: str,
+        pcre2_match_limit: Optional[int] = None,
+        pcre2_depth_limit: Optional[int] = None,
+        pcre2_heap_limit: Optional[int] = None,
+        pcre2_max_jit_stack_size: Optional[int] = None,
+    ) -> "Tokenizer": ...
 
     @staticmethod
-    def from_file(path: str) -> "Tokenizer": ...
+    def from_file(
+        path: str,
+        pcre2_match_limit: Optional[int] = None,
+        pcre2_depth_limit: Optional[int] = None,
+        pcre2_heap_limit: Optional[int] = None,
+        pcre2_max_jit_stack_size: Optional[int] = None,
+    ) -> "Tokenizer": ...
 
     @staticmethod
-    def from_json_str(json: str) -> "Tokenizer": ...
+    def from_json_str(
+        json: str,
+        pcre2_match_limit: Optional[int] = None,
+        pcre2_depth_limit: Optional[int] = None,
+        pcre2_heap_limit: Optional[int] = None,
+        pcre2_max_jit_stack_size: Optional[int] = None,
+    ) -> "Tokenizer": ...
 
     @staticmethod
-    def from_model(model: str) -> "Tokenizer": ...
+    def from_model(
+        model: str,
+        pcre2_match_limit: Optional[int] = None,
+        pcre2_depth_limit: Optional[int] = None,
+        pcre2_heap_limit: Optional[int] = None,
+        pcre2_max_jit_stack_size: Optional[int] = None,
+    ) -> "Tokenizer": ...
 
     @staticmethod
     def from_tiktoken(

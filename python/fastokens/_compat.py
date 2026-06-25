@@ -19,6 +19,19 @@ from fastokens._native import Encoding, Tokenizer
 # _Encoding directly from this module.
 _Encoding = Encoding
 
+def _pcre2_options(
+    pcre2_match_limit: int | None = None,
+    pcre2_depth_limit: int | None = None,
+    pcre2_heap_limit: int | None = None,
+    pcre2_max_jit_stack_size: int | None = None,
+) -> dict[str, int | None]:
+    return {
+        "pcre2_match_limit": pcre2_match_limit,
+        "pcre2_depth_limit": pcre2_depth_limit,
+        "pcre2_heap_limit": pcre2_heap_limit,
+        "pcre2_max_jit_stack_size": pcre2_max_jit_stack_size,
+    }
+
 
 # ---------------------------------------------------------------------------
 # _TokenizerShim
@@ -33,17 +46,32 @@ class _TokenizerShim:
     original ``tokenizers.Tokenizer`` is kept.
     """
 
-    def __init__(self, src) -> None:
+    def __init__(
+        self,
+        src,
+        pcre2_match_limit: int | None = None,
+        pcre2_depth_limit: int | None = None,
+        pcre2_heap_limit: int | None = None,
+        pcre2_max_jit_stack_size: int | None = None,
+    ) -> None:
+        self._pcre2_options = _pcre2_options(
+            pcre2_match_limit,
+            pcre2_depth_limit,
+            pcre2_heap_limit,
+            pcre2_max_jit_stack_size,
+        )
         if isinstance(src, str):
             self._json = src
-            self._fast = Tokenizer.from_json_str(src)
+            self._fast = Tokenizer.from_json_str(src, **self._pcre2_options)
         elif isinstance(src, _TokenizerShim):
             self._json = src._json
-            self._fast = Tokenizer.from_json_str(src._json)
+            if all(value is None for value in self._pcre2_options.values()):
+                self._pcre2_options = dict(src._pcre2_options)
+            self._fast = Tokenizer.from_json_str(src._json, **self._pcre2_options)
         elif hasattr(src, "to_str"):
             # Accept a real tokenizers.Tokenizer (e.g. from convert_slow_tokenizer).
             self._json = src.to_str()
-            self._fast = Tokenizer.from_json_str(self._json)
+            self._fast = Tokenizer.from_json_str(self._json, **self._pcre2_options)
         else:
             raise TypeError(
                 f"expected JSON string, _TokenizerShim, or tokenizers.Tokenizer; "
@@ -59,6 +87,7 @@ class _TokenizerShim:
             self._fast.truncation,
             self._fast.padding,
             self._encode_special_tokens,
+            self._pcre2_options,
         )
 
     def __setstate__(self, state) -> None:
@@ -66,8 +95,12 @@ class _TokenizerShim:
             # Backwards compat: old pickles stored just the JSON string.
             self.__init__(state)  # type: ignore[misc]
         else:
-            json_str, trunc, pad, enc_special = state
-            self.__init__(json_str)  # type: ignore[misc]
+            if len(state) == 4:
+                json_str, trunc, pad, enc_special = state
+                pcre2_options = {}
+            else:
+                json_str, trunc, pad, enc_special, pcre2_options = state
+            self.__init__(json_str, **pcre2_options)  # type: ignore[misc]
             if trunc is not None:
                 self._fast.enable_truncation(**trunc)
             if pad is not None:
@@ -78,7 +111,8 @@ class _TokenizerShim:
         new = object.__new__(_TokenizerShim)
         memo[id(self)] = new
         new._json = self._json
-        new._fast = Tokenizer.from_json_str(self._json)
+        new._pcre2_options = dict(self._pcre2_options)
+        new._fast = Tokenizer.from_json_str(self._json, **new._pcre2_options)
         trunc = self._fast.truncation
         if trunc is not None:
             new._fast.enable_truncation(**trunc)
@@ -94,12 +128,12 @@ class _TokenizerShim:
     # -- Factory class methods ------------------------------------------
 
     @classmethod
-    def from_str(cls, json_str: str) -> _TokenizerShim:
-        return cls(json_str)
+    def from_str(cls, json_str: str, **kwargs) -> _TokenizerShim:
+        return cls(json_str, **kwargs)
 
     @classmethod
-    def from_file(cls, path: str) -> _TokenizerShim:
-        return cls(Path(path).read_text(encoding="utf-8"))
+    def from_file(cls, path: str, **kwargs) -> _TokenizerShim:
+        return cls(Path(path).read_text(encoding="utf-8"), **kwargs)
 
     @classmethod
     def from_pretrained(
@@ -107,17 +141,18 @@ class _TokenizerShim:
         identifier: str,
         revision: str = "main",
         token: str | None = None,
+        **kwargs,
     ) -> _TokenizerShim:
         from huggingface_hub import hf_hub_download
 
         path = hf_hub_download(
             identifier, "tokenizer.json", revision=revision, token=token,
         )
-        return cls.from_file(path)
+        return cls.from_file(path, **kwargs)
 
     @classmethod
-    def from_buffer(cls, buf: bytes) -> _TokenizerShim:
-        return cls(buf.decode("utf-8"))
+    def from_buffer(cls, buf: bytes, **kwargs) -> _TokenizerShim:
+        return cls(buf.decode("utf-8"), **kwargs)
 
     # -- Serialization --------------------------------------------------
 

@@ -666,7 +666,6 @@ struct RawBpe {
     #[allow(dead_code)]
     fuse_unk: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     byte_fallback: bool,
     #[serde(default)]
     ignore_merges: bool,
@@ -894,10 +893,12 @@ pub struct Bpe {
     id_to_token: Vec<String>,
     token_to_id: FxHashMap<String, u32>,
     byte_to_initial_token: [u32; 256],
+    byte_fallback_token_ids: [u32; 256],
     ranked_merge_map: RankedMergeMap,
     byte_pair_initial: Vec<(u32, u32)>,
     merge_adj: MergeAdjacency,
     ignore_merges: bool,
+    byte_fallback: bool,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -907,6 +908,7 @@ impl TryFrom<RawBpe> for Bpe {
         let merge_map = parse_merges(&raw.vocab, &raw.merges)?;
         let mut bpe = Self::new(&raw.vocab, merge_map)?;
         bpe.ignore_merges = raw.ignore_merges;
+        bpe.byte_fallback = raw.byte_fallback;
         Ok(bpe)
     }
 }
@@ -1119,6 +1121,14 @@ impl Bpe {
             }
         }
 
+        let mut byte_fallback_token_ids = [INVALID_TOKEN; 256];
+        for byte_val in 0u16..256 {
+            let token = format!("<0x{byte_val:02X}>");
+            if let Some(&id) = vocab.get(token.as_str()) {
+                byte_fallback_token_ids[byte_val as usize] = id;
+            }
+        }
+
         // Pre-compute initial byte-pair merges (256×256 table).
         let mut byte_pair_initial = vec![(u32::MAX, 0u32); 65536];
         for b1 in 0u16..256 {
@@ -1155,10 +1165,12 @@ impl Bpe {
                 m
             },
             byte_to_initial_token,
+            byte_fallback_token_ids,
             ranked_merge_map,
             byte_pair_initial,
             merge_adj,
             ignore_merges: false,
+            byte_fallback: false,
         })
     }
 
@@ -1330,20 +1342,38 @@ impl Bpe {
             for ch in input.chars() {
                 let mut buf = [0u8; 4];
                 let s = ch.encode_utf8(&mut buf);
-                let id = self
-                    .token_to_id
-                    .get(s)
-                    .copied()
-                    .ok_or_else(|| format!("character {ch:?} not in vocabulary"))?;
-                scratch.symbols.push(MergeSymbol {
-                    c: id,
-                    prev: if n == 0 { -1 } else { (n - 1) as i32 },
-                    next: -1,
-                });
-                if n > 0 {
-                    scratch.symbols[n - 1].next = n as i32;
+                if let Some(id) = self.token_to_id.get(s).copied() {
+                    scratch.symbols.push(MergeSymbol {
+                        c: id,
+                        prev: if n == 0 { -1 } else { (n - 1) as i32 },
+                        next: -1,
+                    });
+                    if n > 0 {
+                        scratch.symbols[n - 1].next = n as i32;
+                    }
+                    n += 1;
+                    continue;
                 }
-                n += 1;
+
+                if !self.byte_fallback {
+                    return Err(format!("character {ch:?} not in vocabulary"));
+                }
+
+                for &byte in s.as_bytes() {
+                    let id = self.byte_fallback_token_ids[byte as usize];
+                    if id == INVALID_TOKEN {
+                        return Err(format!("byte fallback token <0x{byte:02X}> not in vocabulary"));
+                    }
+                    scratch.symbols.push(MergeSymbol {
+                        c: id,
+                        prev: if n == 0 { -1 } else { (n - 1) as i32 },
+                        next: -1,
+                    });
+                    if n > 0 {
+                        scratch.symbols[n - 1].next = n as i32;
+                    }
+                    n += 1;
+                }
             }
 
             if n == 1 {
@@ -1567,7 +1597,7 @@ impl Bpe {
         }));
     }
 
-    #[inline(always)]
+#[inline(always)]
     fn run_merge_loop(&self, scratch: &mut MergeScratch, out: &mut Vec<u32>) {
         let symbols = &mut scratch.symbols;
         let heap = &mut scratch.heap;
@@ -1917,10 +1947,12 @@ impl Clone for Bpe {
             id_to_token: self.id_to_token.clone(),
             token_to_id: self.token_to_id.clone(),
             byte_to_initial_token: self.byte_to_initial_token,
+            byte_fallback_token_ids: self.byte_fallback_token_ids,
             ranked_merge_map: self.ranked_merge_map.clone(),
             byte_pair_initial: self.byte_pair_initial.clone(),
             merge_adj: self.merge_adj.clone(),
             ignore_merges: self.ignore_merges,
+            byte_fallback: self.byte_fallback,
         }
     }
 }
@@ -1942,6 +1974,7 @@ impl PartialEq for Bpe {
             && self.next_prefix_map == other.next_prefix_map
             && self.token_lens == other.token_lens
             && self.ignore_merges == other.ignore_merges
+            && self.byte_fallback == other.byte_fallback
     }
 }
 

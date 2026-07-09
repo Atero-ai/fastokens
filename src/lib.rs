@@ -26,7 +26,7 @@ pub use self::{
         PreTokenizerKind, TokenizerJson,
     },
     models::Model,
-    normalizers::{Nfc, Normalizer},
+    normalizers::{Nfc, Normalizer, Replace},
     post_processors::PostProcessor,
     pre_tokenizers::{ByteLevel, Pcre2Limits, PreTokenizer, Split, SplitBehavior},
     tiktoken::{CL100K_BASE_PATTERN, O200K_BASE_PATTERN, TiktokenConfig},
@@ -703,6 +703,11 @@ impl Tokenizer {
     /// updates the post-processor (e.g. for `add_bos_token=True`).
     pub fn set_post_processor(&mut self, pp: Option<PostProcessor>) {
         self.post_processor = pp;
+    }
+
+    /// Replace the normalizer.
+    pub fn set_normalizer(&mut self, normalizer: Option<Normalizer>) {
+        self.normalizer = normalizer;
     }
 
     pub fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {

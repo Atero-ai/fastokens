@@ -1602,7 +1602,11 @@ impl Bpe {
         let symbols = &mut scratch.symbols;
         let heap = &mut scratch.heap;
 
+        let mut loop_count = 0usize;
+
         while let Some(Reverse(entry)) = heap.pop() {
+            loop_count += 1;
+
             let pos = entry.pos() as usize;
             let sym = symbols[pos];
 
@@ -1655,6 +1659,10 @@ impl Bpe {
                     heap.push(Reverse(MergeEntry::new(rank, pos as u32, new_id, next_c)));
                 }
             }
+        }
+
+        if loop_count > 0 {
+            println!("fastokens debug -> BPE Merge Loop iterations: {}", loop_count);
         }
 
         let mut i: i32 = 0;

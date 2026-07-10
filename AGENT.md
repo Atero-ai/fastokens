@@ -29,6 +29,7 @@ for Gemma. That part was already correct; the problem was purely chunking.
 ### 3. The Fix That Worked: newline pre-splitting
 
 Key insight from the llama.cpp Gemma4 PR:
+Link to said PR: https://github.com/ggml-org/llama.cpp/pull/21343
 
 ```
 regex_exprs = { "[^\\n]+|[\\n]+" };  // split ONLY on newlines

@@ -2,56 +2,116 @@
 
 ### 1. Objective and Current Status
 
-* **The Goal:** Adapt the `fastokens` library to support `GemmaTokenizer` while maintaining the massive 6x–33x speedups seen with models like `GPT-OSS-120b`.
-* **The Additions:** Added the `Replace` normalizer, `ByteFallback` decoder, and `byte_fallback=True` initialization in the BPE engine.
-* **Current Status:** Tokenization is 100% mathematically accurate but only achieves a **1.5x to 1.6x speedup**.
+* **The Goal:** Adapt `fastokens` to support `GemmaTokenizer` while keeping the large speedups seen on byte-level models like `GPT-OSS-120b`.
+* **Correctness:** 100% parity with HuggingFace on `google/gemma-4-E2B` across ShareGPT52K (45,332 samples) and LongBench-v2 (503 samples).
+* **Performance (measured, release build, after newline split + debug-print
+  removal + ASCII fast-path):**
+  * ShareGPT52K: **3.85x** — 19.82 MB/s vs HF 5.15 MB/s (was ~1.5x)
+  * LongBench-v2: **8.61x** — 24.95 MB/s vs HF 2.90 MB/s (was ~1.5x)
 
-### 2. The Core Bottleneck: Priority Queue Thrashing
+### 2. The Root Cause (recap)
 
-Through debugging (adding a counter to `run_merge_loop`), we discovered that the time is being lost in the BPE priority-queue heap.
+Gemma is an SPM/metaspace pipeline:
 
-* **GPT-OSS:** Processes chunks in **10–60 iterations**.
-* **Gemma:** Processes chunks in **5,000–9,000 iterations**.
-* **The Cause:** `fastokens` achieves its insane speed by relying on a word-level cache (`TL_BPE_CACHE`). For Gemma, this cache is being completely starved, forcing the tokenizer to process entire documents through the slow BPE priority-queue fallback.
+1. **Normalizer** (`Replace`) rewrites every space `" "` → `"▁"`.
+2. **Pre-tokenizer** is `Split(pattern=" ", behavior=MergedWithPrevious)`.
 
-### 3. The Architectural Root Cause: The Normalizer Quirk
+Because the normalizer runs *before* the pre-tokenizer, all spaces are gone by the
+time the space-`Split` runs, so it matches nothing and is a **no-op**. The entire
+document reaches the BPE engine as one giant chunk: the word-level cache
+(`TL_BPE_CACHE`) never hits, the ≥16-split rayon parallelism never triggers, and
+the priority-queue BPE runs `O(N log N)` over the whole document.
 
-The reason the cache is starved lies in a quirk of how Hugging Face configured Gemma:
+The BPE math itself is char-based (`merge_all_encoded_into`), using raw UTF-8 with
+`<0xXX>` byte-fallback — i.e. `byte_encode = false`, exactly as llama.cpp specifies
+for Gemma. That part was already correct; the problem was purely chunking.
 
-1. **The Normalizer:** Replaces all spaces (`" "`) with a replacement character (`"▁"`).
-2. **The Pre-Tokenizer:** Is configured to split on spaces (`pattern=" "`, `behavior="merged_with_previous"`).
-3. **The Flaw:** Because the normalizer runs *before* the pre-tokenizer, all spaces are destroyed before the pre-tokenizer can see them. The pre-tokenizer finds zero matches and acts as a complete no-op.
-4. **The Result:** A 10,000-word document is passed to the BPE loop as a single, massive, unbroken string. The `TL_BPE_CACHE` never hits, and the BPE priority queue suffers $O(N \log N)$ thrashing.
+### 3. The Fix That Worked: newline pre-splitting
 
-### 4. Attempted Mitigations and Why They Failed
+Key insight from the llama.cpp Gemma4 PR:
 
-We attempted to artificially chunk the string before it hit the BPE engine to feed the cache, but ran into strict token-parity failures due to Gemma's BPE training data (which includes a lot of code and HTML).
+```
+regex_exprs = { "[^\\n]+|[\\n]+" };  // split ONLY on newlines
+byte_encode = false;                  // raw UTF-8, not GPT-2 byte encoding
+```
 
-* **Attempt 1: Greedy Prefix Matching (in `bpe.rs`)**
-* *Approach:* Scan ahead up to 16 characters to group existing vocab tokens directly, bypassing the heap.
-* *Why it failed:* BPE is rank-based, not length-based. Greedy matching stole characters that were supposed to be merged across boundaries based on higher BPE ranks.
+`split_on_newlines()` in `src/lib.rs` re-slices each text split at every transition
+between newline and non-newline characters, so each resulting split is either a run
+of `\n` or a run of non-`\n`. It runs in the non-fused encode path right after
+pre-tokenization.
 
+**Why it is output-preserving:** Gemma's BPE never merges across the
+newline/non-newline boundary, so splitting there loses no merge. Consecutive
+newlines stay grouped (the `[\n]+` run), so `\n\n` still merges into its own token
+(id 108) — this was exactly the failure mode of the earlier "Attempt 3". It is a
+**no-op for byte-level models**, whose buffers contain no raw `0x0A` byte after byte
+encoding, so other models are unaffected.
 
-* **Attempt 2: `split_inclusive('▁')` (in `lib.rs`)**
-* *Approach:* Emulate Hugging Face's intended pre-tokenizer behavior by splitting on `▁`, leaving the character at the *end* of the chunk (e.g., `"[human]: ▁"`).
-* *Why it failed:* It separated `▁` from the word that followed it (e.g., `root`), preventing necessary cross-boundary merges like `▁` + `root` -> `▁root` (token `5989`).
+**Why the earlier `▁`-splitting attempts failed** (still true — do not retry):
+Gemma's vocab has cross-word merges like `>▁`, and `▁` merges rightward into the
+following word. Splitting on `▁` severs those merges and breaks parity. Newline is
+the only *trivially* safe boundary.
 
+### 4. Other Applied Micro-Optimizations
 
-* **Attempt 3: Custom Split *Before* `▁` and `\n**`
-* *Approach:* Split the string right before `▁` to keep it attached to the target word, and split after `\n` to keep chunks small.
-* *Why it failed:* Splitting unconditionally on `\n` separated consecutive newlines, preventing the BPE from merging `\n` + `\n` into the double-newline token (token `108`).
+* **Removed the debug `println!` in `run_merge_loop`** (`bpe.rs`). It fired on every
+  cache-miss chunk; under rayon, `stdout`'s global lock **serialized all worker
+  threads**. This was a major parallel bottleneck.
+* **ASCII fast-path char→token lookup** (`bpe.rs`, `single_char_token: [u32; 128]`).
+  The char-based merge engine previously did a HashMap probe per character; ASCII
+  characters (the bulk of most text) now use a flat array lookup. Non-ASCII (incl.
+  `▁`, U+2581) still uses the HashMap. Measured: small positive gain with parity
+  intact (3.74→3.85x ShareGPT, 8.04→8.61x LongBench).
 
+### 5. The Big Remaining Lever: vocab-bigram safe splitting
 
-* **Attempt 4: Strict Split *Before* `▁` Only**
-* *Approach:* Removed newline splitting; split strictly right before `▁` if it preceded a word.
-* *Why it failed:* **Cross-boundary code/HTML merges.** In HTML strings (e.g., `</p>▁Op`), slicing the string between `>` and `▁` built a wall between the two characters. Gemma's vocabulary contains highly ranked cross-boundary tokens like `>▁`. The artificial boundary prevented these exact merges, failing the parity tests.
+The structural ceiling today is that Gemma chunks are whole **lines**. Byte-level
+30x models split at **word** level (GPT-2 regex) → tiny chunks → ~100% cache hits +
+cheap per-chunk BPE. A long line (prose paragraph, minified JSON, long code line)
+is still one big chunk with poor cache reuse.
 
+**Idea — provably-safe fine-grained splitting via absent vocab bigrams:**
 
+> A split between input bytes `x | y` can never be crossed by BPE if no vocabulary
+> token contains the adjacent byte pair `xy`. Proof: any output token's byte string
+> is a contiguous substring of the input and is itself in the vocab (all merges
+> produce vocab tokens). If `x` and `y` ended up in the same token, that token would
+> contain substring `xy` — contradiction. Splitting there is therefore
+> output-preserving.
 
-### 5. Key Takeaways for the Next Agent
+Build a `[bool; 256*256]` table `bridgeable[x*256+y]` = "some vocab token contains
+adjacent bytes x,y". At encode time, insert a split at every position where
+`!bridgeable[prev*256+cur]`. This generalizes the newline trick and would break long
+lines into near-word-level chunks **for free, with provable parity**, likely closing
+much of the gap to the byte-level models. Runtime cost is one flat-array lookup per
+byte — far cheaper than the BPE it saves.
 
-1. **Do not attempt manual string chunking:** Gemma's BPE vocabulary relies heavily on cross-boundary merges (punctuation + space, tags + space). Any artificial string slicing will inevitably break tokenization parity.
-2. **The 1.5x Speedup is accurate:** The current implementation is outperforming Hugging Face's raw BPE loop by 50%. The lack of a 30x speedup is a structural reality of Gemma passing massive strings to the BPE engine, not a bug in the Rust port.
-3. **Future Optimization Vectors:** If optimization continues, it must happen *inside* `run_merge_loop` or `init_merge_heap` in a way that respects mathematical BPE ranks.
-* *Idea:* Pre-filtering unmergeable byte-fallback sequences before pushing them to the priority queue to reduce stale-entry heap bloat.
-* *Idea:* Optimizing the memory layout or stale-entry cleanup logic of the BinaryHeap itself.
+**Caveat to handle before shipping:** byte-fallback. Out-of-vocab characters are
+emitted as `<0xXX>` tokens whose *strings* are not the raw bytes, so the bigram
+argument needs to either (a) restrict split points to boundaries where both sides
+are in-vocab single-char tokens, or (b) confirm Gemma's `<0xXX>` fallback tokens are
+terminal (never merge). Validate with `./validate_model.sh google/gemma-4-E2B`
+(it checks parity, not just speed).
+
+### 6. Smaller Opportunities
+
+* **Bypass `shared_cache` for low-reuse chunks.** On Gemma the cross-thread
+  `SharedCache` (sharded `Mutex<HashMap<String, Vec<u32>>>`) is inserted on *every*
+  miss with a `String` + `Vec` allocation and a lock. With mostly-unique line chunks
+  under parallelism this is contention + allocation for near-zero hit rate. Consider
+  gating shared-cache population by chunk length / observed hit rate, or relying on
+  the thread-local `FlatCache` alone.
+* **Bulk heapify in the encoded path.** `merge_all_raw_into` seeds initial pairs into
+  `heap_buf` then bulk-extends; `merge_all_encoded_into` calls `init_merge_heap`.
+  Verify the encoded path gets the same bulk-heapify treatment.
+* **`▁` single-token fast path.** One HashMap probe per word is spent on the
+  metaspace char; a dedicated cached id would remove it (minor).
+
+### 7. Ground Truth / How to Validate
+
+* `./validate_model.sh google/gemma-4-E2B` — parity + speed on ShareGPT52K and
+  LongBench-v2. **Parity is the gate**; any splitting change must keep it green.
+* `cargo test --lib --no-default-features` — offline unit tests (includes
+  `newline_split_tests`).
+* The 30x figure is a byte-level, word-split ceiling. For Gemma, §5 is the realistic
+  path to substantially beyond 8x while preserving exact parity.

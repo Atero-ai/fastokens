@@ -894,6 +894,10 @@ pub struct Bpe {
     token_to_id: FxHashMap<String, u32>,
     byte_to_initial_token: [u32; 256],
     byte_fallback_token_ids: [u32; 256],
+    /// Token id for each single ASCII-character string (`INVALID_TOKEN` when
+    /// absent). Fast path for the char-based merge engine, avoiding a HashMap
+    /// probe per character.
+    single_char_token: [u32; 128],
     ranked_merge_map: RankedMergeMap,
     byte_pair_initial: Vec<(u32, u32)>,
     merge_adj: MergeAdjacency,
@@ -1147,6 +1151,15 @@ impl Bpe {
             }
         }
 
+        let mut single_char_token = [INVALID_TOKEN; 128];
+        for (byte, slot) in single_char_token.iter_mut().enumerate() {
+            let ch = byte as u8 as char;
+            let mut buf = [0u8; 1];
+            if let Some(&id) = vocab.get(ch.encode_utf8(&mut buf) as &str) {
+                *slot = id;
+            }
+        }
+
         let vocab_size = id_to_token.len();
         let merge_adj = MergeAdjacency::from_parsed(&merge_map, vocab_size);
 
@@ -1166,6 +1179,7 @@ impl Bpe {
             },
             byte_to_initial_token,
             byte_fallback_token_ids,
+            single_char_token,
             ranked_merge_map,
             byte_pair_initial,
             merge_adj,
@@ -1342,7 +1356,13 @@ impl Bpe {
             for ch in input.chars() {
                 let mut buf = [0u8; 4];
                 let s = ch.encode_utf8(&mut buf);
-                if let Some(id) = self.token_to_id.get(s).copied() {
+                let found = if ch.is_ascii() {
+                    let id = self.single_char_token[ch as usize];
+                    (id != INVALID_TOKEN).then_some(id)
+                } else {
+                    self.token_to_id.get(s).copied()
+                };
+                if let Some(id) = found {
                     scratch.symbols.push(MergeSymbol {
                         c: id,
                         prev: if n == 0 { -1 } else { (n - 1) as i32 },
@@ -1602,11 +1622,7 @@ impl Bpe {
         let symbols = &mut scratch.symbols;
         let heap = &mut scratch.heap;
 
-        let mut loop_count = 0usize;
-
         while let Some(Reverse(entry)) = heap.pop() {
-            loop_count += 1;
-
             let pos = entry.pos() as usize;
             let sym = symbols[pos];
 
@@ -1659,10 +1675,6 @@ impl Bpe {
                     heap.push(Reverse(MergeEntry::new(rank, pos as u32, new_id, next_c)));
                 }
             }
-        }
-
-        if loop_count > 0 {
-            println!("fastokens debug -> BPE Merge Loop iterations: {}", loop_count);
         }
 
         let mut i: i32 = 0;
@@ -1956,6 +1968,7 @@ impl Clone for Bpe {
             token_to_id: self.token_to_id.clone(),
             byte_to_initial_token: self.byte_to_initial_token,
             byte_fallback_token_ids: self.byte_fallback_token_ids,
+            single_char_token: self.single_char_token,
             ranked_merge_map: self.ranked_merge_map.clone(),
             byte_pair_initial: self.byte_pair_initial.clone(),
             merge_adj: self.merge_adj.clone(),

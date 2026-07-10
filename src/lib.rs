@@ -678,16 +678,17 @@ impl Tokenizer {
             pt.pre_tokenize(&mut pts)?;
         }
 
-        // 2b. Break each text split on newline boundaries (runs of non-newline
-        //     vs. runs of newline, i.e. llama.cpp's `[^\n]+|[\n]+`). For SPM
-        //     pipelines like Gemma the normalizer rewrites spaces to `▁`, so the
-        //     configured space-Split is a no-op and the whole document reaches
-        //     the BPE engine as one giant chunk. Gemma's BPE never merges across
-        //     the newline/non-newline boundary, so this is output-preserving
-        //     while restoring the per-line cache and parallel tokenization. It
-        //     is a no-op for byte-level pipelines, whose buffers contain no raw
-        //     `\n` byte after byte encoding.
-        split_on_newlines(&mut pts);
+        // 2b. Break each text split at unbridgeable byte-pair boundaries.
+        //     For models with a bigram bridge table (BPE), split at positions
+        //     where adjacent bytes never appear together in any vocab token.
+        //     This is provably output-preserving and enables fine-grained
+        //     word-level chunking. Falls back to newline splitting for models
+        //     without a table (shouldn't happen currently).
+        if let Some(table) = self.model.bigram_bridge_table() {
+            split_on_unbridgeable_bigrams(&mut pts, table);
+        } else {
+            split_on_newlines(&mut pts);
+        }
 
         // 3. Tokenize each text split with the model.
         let ids = pts
@@ -927,6 +928,59 @@ fn split_on_newlines(pts: &mut PreTokenizedString) {
                 prev_nl = is_nl;
             }
         }
+        new_splits.push(PtSplit {
+            range: start..end,
+            token_id: None,
+        });
+    }
+
+    pts.refine_splits(new_splits);
+}
+
+/// Split each text chunk at unbridgeable byte-pair boundaries using the
+/// vocab-derived bigram bridge table.
+///
+/// A byte pair (prev, cur) is "unbridgeable" if no vocabulary token contains
+/// that adjacent byte sequence. Splitting at such boundaries is provably
+/// output-preserving: any BPE merge that spans the boundary would produce a
+/// token containing that byte pair, which cannot exist in the vocabulary.
+///
+/// This generalizes newline splitting and enables fine-grained word-level
+/// chunking even in metaspace tokenizers like Gemma, where the pre-tokenizer
+/// is effectively a no-op after normalization.
+fn split_on_unbridgeable_bigrams(
+    pts: &mut PreTokenizedString,
+    bigram_table: &models::bpe::BigramBridgeTable,
+) {
+    let bytes = pts.buffer().as_bytes();
+    let mut new_splits = Vec::with_capacity(pts.splits().len() * 2);
+
+    for split in pts.splits() {
+        if split.token_id.is_some() || split.range.is_empty() {
+            new_splits.push(split.clone());
+            continue;
+        }
+
+        let end = split.range.end;
+        let mut start = split.range.start;
+
+        for i in (start + 1)..end {
+            let prev = bytes[i - 1];
+            let cur = bytes[i];
+
+            // Split here if:
+            // 1. This byte pair never appears in vocab, AND
+            // 2. Position i is a UTF-8 char boundary (cur is not a continuation byte)
+            if !bigram_table.is_bridgeable(prev, cur) && (cur & 0xC0) != 0x80 {
+                new_splits.push(PtSplit {
+                    range: start..i,
+                    token_id: None,
+                });
+                start = i;
+            }
+        }
+
+        // Push the final segment
         new_splits.push(PtSplit {
             range: start..end,
             token_id: None,

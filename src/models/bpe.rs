@@ -97,6 +97,69 @@ impl MergeMap {
     }
 }
 
+/// Bigram bridgeability table for vocab-aware safe splitting.
+///
+/// For each of 256×256 possible byte pairs, records whether that pair
+/// appears in any vocabulary token. Used to identify split points that
+/// cannot be crossed by BPE merges.
+#[derive(Clone, PartialEq)]
+pub struct BigramBridgeTable {
+    /// Flat array: bridgeable[prev * 256 + cur] == true if some vocab
+    /// token contains adjacent bytes (prev, cur).
+    bridgeable: Box<[bool; 65536]>,
+}
+
+impl BigramBridgeTable {
+    /// Check if a byte pair can be bridged by some vocab token.
+    #[inline(always)]
+    pub fn is_bridgeable(&self, prev: u8, cur: u8) -> bool {
+        self.bridgeable[prev as usize * 256 + cur as usize]
+    }
+
+    /// Construct from a pre-computed array (for const tables).
+    pub fn from_array(arr: [bool; 65536]) -> Self {
+        Self {
+            bridgeable: Box::new(arr),
+        }
+    }
+
+    /// Return (bridgeable_count, unbridgeable_count) statistics.
+    pub fn stats(&self) -> (usize, usize) {
+        let bridgeable = self.bridgeable.iter().filter(|&&b| b).count();
+        let unbridgeable = 65536 - bridgeable;
+        (bridgeable, unbridgeable)
+    }
+}
+
+/// Build a bigram bridge table by scanning all vocab tokens.
+fn build_bigram_bridge_table(id_to_token: &[String]) -> BigramBridgeTable {
+    let mut bridgeable = Box::new([false; 65536]);
+
+    for token_str in id_to_token {
+        let bytes = token_str.as_bytes();
+        // Mark all adjacent byte pairs in this token as bridgeable
+        for window in bytes.windows(2) {
+            let prev = window[0] as usize;
+            let cur = window[1] as usize;
+            bridgeable[prev * 256 + cur] = true;
+        }
+    }
+
+    let table = BigramBridgeTable { bridgeable };
+
+    // Diagnostic: print statistics on first build
+    let (bridgeable_count, unbridgeable_count) = table.stats();
+    eprintln!(
+        "Bigram bridge table: {} bridgeable pairs ({:.1}%), {} unbridgeable ({:.1}%)",
+        bridgeable_count,
+        bridgeable_count as f64 / 65536.0 * 100.0,
+        unbridgeable_count,
+        unbridgeable_count as f64 / 65536.0 * 100.0
+    );
+
+    table
+}
+
 #[inline(always)]
 fn pack_pair(t1: u32, t2: u32) -> u64 {
     (t1 as u64) << 32 | t2 as u64
@@ -903,6 +966,7 @@ pub struct Bpe {
     merge_adj: MergeAdjacency,
     ignore_merges: bool,
     byte_fallback: bool,
+    pub bigram_bridge_table: BigramBridgeTable,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -1163,6 +1227,8 @@ impl Bpe {
         let vocab_size = id_to_token.len();
         let merge_adj = MergeAdjacency::from_parsed(&merge_map, vocab_size);
 
+        let bigram_bridge_table = build_bigram_bridge_table(&id_to_token);
+
         Ok(Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             daac,
@@ -1185,6 +1251,7 @@ impl Bpe {
             merge_adj,
             ignore_merges: false,
             byte_fallback: false,
+            bigram_bridge_table,
         })
     }
 
@@ -1974,6 +2041,7 @@ impl Clone for Bpe {
             merge_adj: self.merge_adj.clone(),
             ignore_merges: self.ignore_merges,
             byte_fallback: self.byte_fallback,
+            bigram_bridge_table: self.bigram_bridge_table.clone(),
         }
     }
 }

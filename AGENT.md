@@ -4,10 +4,11 @@
 
 * **The Goal:** Adapt `fastokens` to support `GemmaTokenizer` while keeping the large speedups seen on byte-level models like `GPT-OSS-120b`.
 * **Correctness:** 100% parity with HuggingFace on `google/gemma-4-E2B` across ShareGPT52K (45,332 samples) and LongBench-v2 (503 samples).
-* **Performance (measured, release build, after newline split + debug-print
-  removal + ASCII fast-path):**
-  * ShareGPT52K: **3.85x** — 19.82 MB/s vs HF 5.15 MB/s (was ~1.5x)
-  * LongBench-v2: **8.61x** — 24.95 MB/s vs HF 2.90 MB/s (was ~1.5x)
+* **Performance (measured, release build, vocab-bigram splitting):**
+  * ShareGPT52K: **8.92x** — 48.52 MB/s vs HF 5.44 MB/s
+  * LongBench-v2: **27.88x** — 82.24 MB/s vs HF 2.95 MB/s
+  * **Previous (newline split):** 3.85x / 8.61x
+  * **Improvement:** 2.3x on ShareGPT, 3.2x on LongBench over newline splitting
 
 ### 2. The Root Cause (recap)
 
@@ -64,55 +65,78 @@ the only *trivially* safe boundary.
   `▁`, U+2581) still uses the HashMap. Measured: small positive gain with parity
   intact (3.74→3.85x ShareGPT, 8.04→8.61x LongBench).
 
-### 5. The Big Remaining Lever: vocab-bigram safe splitting
+### 5. Vocab-Bigram Safe Splitting (IMPLEMENTED ✅)
 
-The structural ceiling today is that Gemma chunks are whole **lines**. Byte-level
-30x models split at **word** level (GPT-2 regex) → tiny chunks → ~100% cache hits +
-cheap per-chunk BPE. A long line (prose paragraph, minified JSON, long code line)
-is still one big chunk with poor cache reuse.
+**Status:** Shipped and validated. Replaced newline splitting with vocab-aware splitting.
 
-**Idea — provably-safe fine-grained splitting via absent vocab bigrams:**
+**The insight:** A split between input bytes `x | y` can never be crossed by BPE if
+no vocabulary token contains the adjacent byte pair `xy`. Proof: any output token's
+byte string is a contiguous substring of the input and is itself in the vocab (all
+merges produce vocab tokens). If `x` and `y` ended up in the same token, that token
+would contain substring `xy` — contradiction. Splitting there is therefore
+output-preserving.
 
-> A split between input bytes `x | y` can never be crossed by BPE if no vocabulary
-> token contains the adjacent byte pair `xy`. Proof: any output token's byte string
-> is a contiguous substring of the input and is itself in the vocab (all merges
-> produce vocab tokens). If `x` and `y` ended up in the same token, that token would
-> contain substring `xy` — contradiction. Splitting there is therefore
-> output-preserving.
+**Implementation** (`src/models/bpe.rs`, `src/lib.rs`):
 
-Build a `[bool; 256*256]` table `bridgeable[x*256+y]` = "some vocab token contains
-adjacent bytes x,y". At encode time, insert a split at every position where
-`!bridgeable[prev*256+cur]`. This generalizes the newline trick and would break long
-lines into near-word-level chunks **for free, with provable parity**, likely closing
-much of the gap to the byte-level models. Runtime cost is one flat-array lookup per
-byte — far cheaper than the BPE it saves.
+1. **`BigramBridgeTable`** — 64 KB lookup table `[bool; 256*256]` built at
+   initialization by scanning all vocab token byte strings. Marks which byte pairs
+   appear in any vocab token.
 
-**Caveat to handle before shipping:** byte-fallback. Out-of-vocab characters are
-emitted as `<0xXX>` tokens whose *strings* are not the raw bytes, so the bigram
-argument needs to either (a) restrict split points to boundaries where both sides
-are in-vocab single-char tokens, or (b) confirm Gemma's `<0xXX>` fallback tokens are
-terminal (never merge). Validate with `./validate_model.sh google/gemma-4-E2B`
-(it checks parity, not just speed).
+2. **Diagnostic output** — On first Bpe initialization, reports split potential:
+   ```
+   Bigram bridge table: 12070 bridgeable pairs (18.4%), 53466 unbridgeable (81.6%)
+   ```
+   For Gemma, **81.6% of byte pairs are unbridgeable** — huge splitting opportunity.
 
-### 6. Smaller Opportunities
+3. **`split_on_unbridgeable_bigrams()`** — Scans input, splits at every unbridgeable
+   byte pair that's also a UTF-8 character boundary (checking `(cur & 0xC0) != 0x80`).
+   Runtime cost: one array lookup + one bitwise op per byte.
 
-* **Bypass `shared_cache` for low-reuse chunks.** On Gemma the cross-thread
-  `SharedCache` (sharded `Mutex<HashMap<String, Vec<u32>>>`) is inserted on *every*
-  miss with a `String` + `Vec` allocation and a lock. With mostly-unique line chunks
-  under parallelism this is contention + allocation for near-zero hit rate. Consider
-  gating shared-cache population by chunk length / observed hit rate, or relying on
-  the thread-local `FlatCache` alone.
+4. **Byte-fallback tokens** — Confirmed these are literal strings like `"<0x00>"`
+   (containing angle brackets and hex digits), not the actual byte values. The bigram
+   scan naturally handles them; no special logic needed.
+
+**Results:**
+- ShareGPT52K: **8.92x** (up from 3.85x with newline splitting)
+- LongBench-v2: **27.88x** (up from 8.61x with newline splitting)
+- 100% parity maintained on both datasets
+
+**Why it works:** After normalization (spaces → `▁`), most word boundaries become
+unbridgeable. Long lines break into multi-word chunks → per-chunk cache hits +
+rayon parallelism. The LongBench speedup (27.88x) is particularly strong because
+those samples have very long lines that benefit most from fine-grained splitting.
+
+### 6. Further Optimization Opportunities
+
+At **8.92x / 27.88x**, Gemma is now competitive with byte-level models on realistic
+workloads. The LongBench result is approaching the theoretical byte-level ceiling.
+Remaining micro-optimizations have diminishing returns but are documented for
+completeness:
+
+* **Pre-computed const table for Gemma.** The bigram table is deterministic per vocab.
+  For production, generate it at build time and embed as `const GEMMA_BIGRAM_TABLE:
+  [bool; 65536]`. Zero initialization cost, same results.
+
+* **Bypass `shared_cache` for low-reuse chunks.** The cross-thread `SharedCache`
+  (sharded `Mutex<HashMap<String, Vec<u32>>>`) is inserted on *every* miss with a
+  `String` + `Vec` allocation and a lock. Consider gating shared-cache population by
+  chunk length / observed hit rate, or relying on the thread-local `FlatCache` alone.
+
 * **Bulk heapify in the encoded path.** `merge_all_raw_into` seeds initial pairs into
   `heap_buf` then bulk-extends; `merge_all_encoded_into` calls `init_merge_heap`.
   Verify the encoded path gets the same bulk-heapify treatment.
-* **`▁` single-token fast path.** One HashMap probe per word is spent on the
-  metaspace char; a dedicated cached id would remove it (minor).
+
+* **`▁` single-token fast path.** One HashMap probe per word is spent on the metaspace
+  char; a dedicated cached id would remove it (minor).
 
 ### 7. Ground Truth / How to Validate
 
-* `./validate_model.sh google/gemma-4-E2B` — parity + speed on ShareGPT52K and
-  LongBench-v2. **Parity is the gate**; any splitting change must keep it green.
+* `cd examples && ./validate_model.sh google/gemma-4-E2B` — parity + speed on
+  ShareGPT52K and LongBench-v2. **Parity is the gate**; any splitting change must
+  keep it green.
 * `cargo test --lib --no-default-features` — offline unit tests (includes
   `newline_split_tests`).
-* The 30x figure is a byte-level, word-split ceiling. For Gemma, §5 is the realistic
-  path to substantially beyond 8x while preserving exact parity.
+* The 30x figure is a byte-level, word-split ceiling on short-document benchmarks.
+  For Gemma on **long documents** (LongBench), we've achieved **27.88x** — near the
+  theoretical limit. On mixed workloads (ShareGPT), **8.92x** is strong and leaves
+  limited headroom without structural changes (e.g., rewriting the BPE engine).

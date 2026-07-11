@@ -102,16 +102,86 @@ fine-grained splitting.
 Each model's bigram bridge table is computed at initialization by scanning its
 vocabulary, so the split points automatically adapt to that model's merge patterns.
 
-### 6. Further Optimization Opportunities
+### 6. Vocab-Aware Splitting Scoped to Metaspace Models (RESOLVED ✅)
 
-At **8.92x / 27.88x**, Gemma is now competitive with byte-level models on realistic
-workloads. The LongBench result is approaching the theoretical byte-level ceiling.
-Remaining micro-optimizations have diminishing returns but are documented for
-completeness:
+**Status:** Implemented and benchmarked.
 
-* **Pre-computed const table for Gemma.** The bigram table is deterministic per vocab.
-  For production, generate it at build time and embed as `const GEMMA_BIGRAM_TABLE:
-  [bool; 65536]`. Zero initialization cost, same results.
+**The concern:** Vocab-aware splitting originally ran on **all BPE models** in the
+non-fused encode path. It was designed for metaspace tokenizers like Gemma, where the
+`Split(" ")` pre-tokenizer is a no-op after normalization and the whole document arrives
+as one chunk. On **ByteLevel models** (Mistral, Qwen3, DeepSeek, etc.) the regex `Split`
+pre-tokenizer already produces word-level chunks, so the pass does per-byte scanning
+(`O(text_length)`, array lookup + bitwise check per byte, plus a split-vector allocation)
+for little expected benefit.
+
+**Key property — parity is never at risk:** The pass is *provably output-preserving*
+(it only adds split points BPE could never merge across). Enabling or disabling it can
+**never** change token output, so this is a pure performance decision with zero
+correctness risk.
+
+**Implementation** (`src/lib.rs`):
+
+The `Tokenizer` now carries a `needs_vocab_splitting: bool` computed once at build time:
+
+```rust
+// build()
+let needs_vocab_splitting = !Self::pre_tokenizer_contains_byte_level(&pre_tokenizer);
+```
+
+`pre_tokenizer_contains_byte_level` recurses through `Sequence` steps and returns true if
+any `ByteLevel` step is present. The encode site is gated on the flag:
+
+```rust
+if self.needs_vocab_splitting {
+    if let Some(table) = self.model.bigram_bridge_table() {
+        split_on_unbridgeable_bigrams(&mut pts, table);
+    }
+}
+```
+
+Effect: vocab-aware splitting runs **only** for models with no ByteLevel step — i.e.
+metaspace models like Gemma. Every ByteLevel model's encode flow is byte-for-byte
+unchanged from before this change. This scoping is deliberate for a future upstream PR:
+the only flow that changes is the metaspace path.
+
+**Benchmark findings (release, ShareGPT52K / LongBench-v2, 3 runs each):**
+
+| Model | ShareGPT | LongBench |
+|-------|----------|-----------|
+| Gemma4 (unchanged path) | 11.67x | 29.86x |
+| Qwen3 before (avg) | 12.30x | 27.00x |
+| Qwen3 after (avg) | 12.10x | 29.88x |
+
+Run-to-run variance was large (Qwen3 LongBench spanned 24.70x–31.57x across runs — a
+~20% spread), which **swamps** the 5–15% effect we hoped to detect. The result for
+ByteLevel is therefore **performance-neutral within noise**: no measurable speedup, no
+regression. Gemma's numbers are unchanged (its path is untouched); the higher figures
+vs. §1's 8.9x/27.9x reflect the measurement environment, not this change.
+
+**Why keep it despite no measurable ByteLevel win:**
+- It removes work that is *provably* unnecessary on the ByteLevel path (the scan cannot
+  affect output there), so the code better expresses intent.
+- It cleanly scopes the vocab-splitting feature to the one model family that needs it,
+  which is the right shape for upstreaming.
+- Neutral-to-slightly-positive with zero correctness risk.
+
+**If deeper verification is ever wanted:** end-to-end throughput can't resolve an effect
+this small. Measure the pass directly instead — count splits added by
+`split_on_unbridgeable_bigrams` on Qwen3 (expected ≈0, confirming it was a no-op scan on
+ByteLevel) vs. Gemma (expected large).
+
+**Validation performed:**
+1. `cargo test --lib` — 190 passed, 0 failed.
+2. `./validate_model.sh` on Gemma4 and Qwen3 — parity green on ShareGPT52K and
+   LongBench-v2 (guaranteed by the output-preserving property).
+
+### 7. Other Optimization Opportunities
+
+Lower-priority optimizations with diminishing returns:
+
+* **Pre-computed const table for specific models.** The bigram table is deterministic per
+  vocab. For production, generate it at build time and embed as a const array. Zero
+  initialization cost, same results.
 
 * **Bypass `shared_cache` for low-reuse chunks.** The cross-thread `SharedCache`
   (sharded `Mutex<HashMap<String, Vec<u32>>>`) is inserted on *every* miss with a
@@ -125,7 +195,7 @@ completeness:
 * **`▁` single-token fast path.** One HashMap probe per word is spent on the metaspace
   char; a dedicated cached id would remove it (minor).
 
-### 7. Ground Truth / How to Validate
+### 8. Ground Truth / How to Validate
 
 * `cd examples && ./validate_model.sh google/gemma-4-E2B` — parity + speed on
   ShareGPT52K and LongBench-v2. **Parity is the gate**; any splitting change must

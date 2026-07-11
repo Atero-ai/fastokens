@@ -312,6 +312,12 @@ pub struct Tokenizer {
     split_only: Option<PreTokenizer>,
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
+    /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
+    /// True for metaspace models (e.g. Gemma) whose pre-tokenizer is a no-op
+    /// after normalization; false for ByteLevel models, whose regex `Split`
+    /// already produces word-level chunks. The pass is output-preserving, so
+    /// this flag only affects performance, never correctness.
+    needs_vocab_splitting: bool,
 }
 
 impl Tokenizer {
@@ -337,6 +343,11 @@ impl Tokenizer {
         // Detect Sequence([Split, ByteLevel(bulk)]) for fused byte-level+BPE.
         let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
 
+        // ByteLevel pipelines already chunk at word boundaries via their regex
+        // Split, so vocab-aware splitting adds cost without benefit. Only run it
+        // when no ByteLevel step is present (metaspace models like Gemma).
+        let needs_vocab_splitting = !Self::pre_tokenizer_contains_byte_level(&pre_tokenizer);
+
         Ok(Self {
             added_tokens,
             normalizer,
@@ -346,7 +357,21 @@ impl Tokenizer {
             decoder,
             split_only,
             input_cache: input_cache_from_env(),
+            needs_vocab_splitting,
         })
+    }
+
+    /// Recursively check whether a pre-tokenizer pipeline contains a `ByteLevel`
+    /// step (including inside a `Sequence`).
+    fn pre_tokenizer_contains_byte_level(pt: &Option<PreTokenizer>) -> bool {
+        fn contains(pt: &PreTokenizer) -> bool {
+            match pt {
+                PreTokenizer::ByteLevel(_) => true,
+                PreTokenizer::Split(_) => false,
+                PreTokenizer::Sequence(steps) => steps.iter().any(contains),
+            }
+        }
+        pt.as_ref().is_some_and(contains)
     }
 
     /// If `pt` is `Sequence([Split, ByteLevel(bulk)])`, return a Split-only
@@ -680,10 +705,13 @@ impl Tokenizer {
 
         // 2b. Break each text split at unbridgeable byte-pair boundaries.
         //     Split at positions where adjacent bytes never appear together in
-        //     any vocab token. This is provably output-preserving and enables
-        //     fine-grained word-level chunking for all BPE models.
-        if let Some(table) = self.model.bigram_bridge_table() {
-            split_on_unbridgeable_bigrams(&mut pts, table);
+        //     any vocab token. This is provably output-preserving and provides
+        //     fine-grained word-level chunking for models that don't use
+        //     ByteLevel (whose regex Split already chunks at word boundaries).
+        if self.needs_vocab_splitting {
+            if let Some(table) = self.model.bigram_bridge_table() {
+                split_on_unbridgeable_bigrams(&mut pts, table);
+            }
         }
 
         // 3. Tokenize each text split with the model.

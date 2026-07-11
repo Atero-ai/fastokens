@@ -679,15 +679,11 @@ impl Tokenizer {
         }
 
         // 2b. Break each text split at unbridgeable byte-pair boundaries.
-        //     For models with a bigram bridge table (BPE), split at positions
-        //     where adjacent bytes never appear together in any vocab token.
-        //     This is provably output-preserving and enables fine-grained
-        //     word-level chunking. Falls back to newline splitting for models
-        //     without a table (shouldn't happen currently).
+        //     Split at positions where adjacent bytes never appear together in
+        //     any vocab token. This is provably output-preserving and enables
+        //     fine-grained word-level chunking for all BPE models.
         if let Some(table) = self.model.bigram_bridge_table() {
             split_on_unbridgeable_bigrams(&mut pts, table);
-        } else {
-            split_on_newlines(&mut pts);
         }
 
         // 3. Tokenize each text split with the model.
@@ -897,45 +893,6 @@ impl Tokenizer {
     }
 }
 
-/// Re-slice every text split of `pts` at each transition between newline and
-/// non-newline characters, so each split is either a run of `\n` or a run of
-/// non-`\n` (matching llama.cpp's Gemma `[^\n]+|[\n]+` pre-split).
-///
-/// `\n` is ASCII 0x0A and never appears as a UTF-8 continuation byte, so every
-/// cut lands on a char boundary. Token splits and empty ranges pass through
-/// unchanged.
-fn split_on_newlines(pts: &mut PreTokenizedString) {
-    let bytes = pts.buffer().as_bytes();
-    let mut new_splits = Vec::with_capacity(pts.splits().len());
-
-    for split in pts.splits() {
-        if split.token_id.is_some() || split.range.is_empty() {
-            new_splits.push(split.clone());
-            continue;
-        }
-
-        let end = split.range.end;
-        let mut start = split.range.start;
-        let mut prev_nl = bytes[start] == b'\n';
-        for i in (start + 1)..end {
-            let is_nl = bytes[i] == b'\n';
-            if is_nl != prev_nl {
-                new_splits.push(PtSplit {
-                    range: start..i,
-                    token_id: None,
-                });
-                start = i;
-                prev_nl = is_nl;
-            }
-        }
-        new_splits.push(PtSplit {
-            range: start..end,
-            token_id: None,
-        });
-    }
-
-    pts.refine_splits(new_splits);
-}
 
 /// Split each text chunk at unbridgeable byte-pair boundaries using the
 /// vocab-derived bigram bridge table.
@@ -988,65 +945,6 @@ fn split_on_unbridgeable_bigrams(
     }
 
     pts.refine_splits(new_splits);
-}
-
-#[cfg(test)]
-mod newline_split_tests {
-    use super::*;
-
-    fn split_texts(input: &str) -> Vec<String> {
-        let mut pts = PreTokenizedString::from_text(input);
-        split_on_newlines(&mut pts);
-        pts.splits()
-            .iter()
-            .map(|s| pts.split_text(s).to_string())
-            .collect()
-    }
-
-    #[test]
-    fn groups_newline_runs_and_line_runs() {
-        assert_eq!(split_texts("a\nb"), vec!["a", "\n", "b"]);
-        // Consecutive newlines stay together so `\n\n` can still merge.
-        assert_eq!(split_texts("a\n\nb"), vec!["a", "\n\n", "b"]);
-        assert_eq!(split_texts("\n\na\n"), vec!["\n\n", "a", "\n"]);
-    }
-
-    #[test]
-    fn no_newline_is_single_split() {
-        assert_eq!(split_texts("hello world"), vec!["hello world"]);
-    }
-
-    #[test]
-    fn all_newlines_is_single_split() {
-        assert_eq!(split_texts("\n\n\n"), vec!["\n\n\n"]);
-    }
-
-    #[test]
-    fn empty_input_has_no_splits() {
-        assert!(split_texts("").is_empty());
-    }
-
-    #[test]
-    fn preserves_added_token_splits() {
-        let buffer = "a\nb".to_string();
-        let splits = vec![
-            PtSplit {
-                range: 0..0,
-                token_id: Some(42),
-            },
-            PtSplit {
-                range: 0..3,
-                token_id: None,
-            },
-        ];
-        let mut pts = PreTokenizedString::new(buffer, splits);
-        split_on_newlines(&mut pts);
-        let s = pts.splits();
-        assert_eq!(s[0].token_id, Some(42));
-        assert_eq!(pts.split_text(&s[1]), "a");
-        assert_eq!(pts.split_text(&s[2]), "\n");
-        assert_eq!(pts.split_text(&s[3]), "b");
-    }
 }
 
 // ---------------------------------------------------------------------------

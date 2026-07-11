@@ -27,32 +27,21 @@ The BPE math itself is char-based (`merge_all_encoded_into`), using raw UTF-8 wi
 `<0xXX>` byte-fallback — i.e. `byte_encode = false`, exactly as llama.cpp specifies
 for Gemma. That part was already correct; the problem was purely chunking.
 
-### 3. The Fix That Worked: newline pre-splitting
+### 3. Evolution: From Newline to Vocab-Aware Splitting
 
-Key insight from the llama.cpp Gemma4 PR:
-Link to said PR: https://github.com/ggml-org/llama.cpp/pull/21343
+**Initial approach (deprecated):** Newline pre-splitting was inspired by llama.cpp's
+Gemma4 PR (https://github.com/ggml-org/llama.cpp/pull/21343), which used
+`regex_exprs = { "[^\\n]+|[\\n]+" }`. This provided 3.85x/8.61x speedup by creating
+per-line chunks.
 
-```
-regex_exprs = { "[^\\n]+|[\\n]+" };  // split ONLY on newlines
-byte_encode = false;                  // raw UTF-8, not GPT-2 byte encoding
-```
-
-`split_on_newlines()` in `src/lib.rs` re-slices each text split at every transition
-between newline and non-newline characters, so each resulting split is either a run
-of `\n` or a run of non-`\n`. It runs in the non-fused encode path right after
-pre-tokenization.
-
-**Why it is output-preserving:** Gemma's BPE never merges across the
-newline/non-newline boundary, so splitting there loses no merge. Consecutive
-newlines stay grouped (the `[\n]+` run), so `\n\n` still merges into its own token
-(id 108) — this was exactly the failure mode of the earlier "Attempt 3". It is a
-**no-op for byte-level models**, whose buffers contain no raw `0x0A` byte after byte
-encoding, so other models are unaffected.
+**Current approach:** Vocab-aware bigram splitting (see section 5) **replaced** newline
+splitting entirely. It's more generic, model-agnostic, and delivers superior
+performance (8.92x/27.88x). The newline approach was removed from the codebase as it
+was strictly inferior.
 
 **Why the earlier `▁`-splitting attempts failed** (still true — do not retry):
 Gemma's vocab has cross-word merges like `>▁`, and `▁` merges rightward into the
-following word. Splitting on `▁` severs those merges and breaks parity. Newline is
-the only *trivially* safe boundary.
+following word. Splitting on `▁` severs those merges and breaks parity.
 
 ### 4. Other Applied Micro-Optimizations
 
@@ -65,9 +54,10 @@ the only *trivially* safe boundary.
   `▁`, U+2581) still uses the HashMap. Measured: small positive gain with parity
   intact (3.74→3.85x ShareGPT, 8.04→8.61x LongBench).
 
-### 5. Vocab-Bigram Safe Splitting (IMPLEMENTED ✅)
+### 5. Vocab-Bigram Safe Splitting (CURRENT IMPLEMENTATION ✅)
 
-**Status:** Shipped and validated. Replaced newline splitting with vocab-aware splitting.
+**Status:** Shipped, validated, and now the **only** splitting strategy. Newline splitting
+has been removed from the codebase.
 
 **The insight:** A split between input bytes `x | y` can never be crossed by BPE if
 no vocabulary token contains the adjacent byte pair `xy`. Proof: any output token's
@@ -101,10 +91,16 @@ output-preserving.
 - LongBench-v2: **27.88x** (up from 8.61x with newline splitting)
 - 100% parity maintained on both datasets
 
-**Why it works:** After normalization (spaces → `▁`), most word boundaries become
-unbridgeable. Long lines break into multi-word chunks → per-chunk cache hits +
-rayon parallelism. The LongBench speedup (27.88x) is particularly strong because
-those samples have very long lines that benefit most from fine-grained splitting.
+**Why it works:** The algorithm is model-agnostic — it adapts to each tokenizer's
+vocabulary automatically. For Gemma specifically, after normalization (spaces → `▁`),
+most word boundaries become unbridgeable. Long lines break into multi-word chunks →
+per-chunk cache hits + rayon parallelism. The LongBench speedup (27.88x) is
+particularly strong because those samples have very long lines that benefit most from
+fine-grained splitting.
+
+**Generality:** This approach works for **all BPE models** without model-specific logic.
+Each model's bigram bridge table is computed at initialization by scanning its
+vocabulary, so the split points automatically adapt to that model's merge patterns.
 
 ### 6. Further Optimization Opportunities
 
@@ -134,8 +130,8 @@ completeness:
 * `cd examples && ./validate_model.sh google/gemma-4-E2B` — parity + speed on
   ShareGPT52K and LongBench-v2. **Parity is the gate**; any splitting change must
   keep it green.
-* `cargo test --lib --no-default-features` — offline unit tests (includes
-  `newline_split_tests`).
+* `cargo test --lib --no-default-features` — offline unit tests (vocab-aware splitting
+  is tested via the full correctness test suite across multiple models).
 * The 30x figure is a byte-level, word-split ceiling on short-document benchmarks.
   For Gemma on **long documents** (LongBench), we've achieved **27.88x** — near the
   theoretical limit. On mixed workloads (ShareGPT), **8.92x** is strong and leaves

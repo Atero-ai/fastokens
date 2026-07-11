@@ -21,6 +21,16 @@ pub enum Error {
     Unsupported(String),
 }
 
+impl From<crate::normalizers::Error> for Error {
+    fn from(e: crate::normalizers::Error) -> Self {
+        match e {
+            crate::normalizers::Error::Json(j) => Self::Json(j),
+            crate::normalizers::Error::Regex(r) => Self::Regex(r),
+            crate::normalizers::Error::Unsupported(s) => Self::Unsupported(s),
+        }
+    }
+}
+
 /// A compiled decoder ready for use.
 #[derive(Debug)]
 pub enum Decoder {

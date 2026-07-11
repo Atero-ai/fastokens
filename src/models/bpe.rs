@@ -115,20 +115,6 @@ impl BigramBridgeTable {
     pub fn is_bridgeable(&self, prev: u8, cur: u8) -> bool {
         self.bridgeable[prev as usize * 256 + cur as usize]
     }
-
-    /// Construct from a pre-computed array (for const tables).
-    pub fn from_array(arr: [bool; 65536]) -> Self {
-        Self {
-            bridgeable: Box::new(arr),
-        }
-    }
-
-    /// Return (bridgeable_count, unbridgeable_count) statistics.
-    pub fn stats(&self) -> (usize, usize) {
-        let bridgeable = self.bridgeable.iter().filter(|&&b| b).count();
-        let unbridgeable = 65536 - bridgeable;
-        (bridgeable, unbridgeable)
-    }
 }
 
 /// Build a bigram bridge table by scanning all vocab tokens.

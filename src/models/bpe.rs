@@ -145,19 +145,7 @@ fn build_bigram_bridge_table(id_to_token: &[String]) -> BigramBridgeTable {
         }
     }
 
-    let table = BigramBridgeTable { bridgeable };
-
-    // Diagnostic: print statistics on first build
-    let (bridgeable_count, unbridgeable_count) = table.stats();
-    eprintln!(
-        "Bigram bridge table: {} bridgeable pairs ({:.1}%), {} unbridgeable ({:.1}%)",
-        bridgeable_count,
-        bridgeable_count as f64 / 65536.0 * 100.0,
-        unbridgeable_count,
-        unbridgeable_count as f64 / 65536.0 * 100.0
-    );
-
-    table
+    BigramBridgeTable { bridgeable }
 }
 
 #[inline(always)]

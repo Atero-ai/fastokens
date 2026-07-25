@@ -5,3 +5,4 @@ __pycache__/
 
 dist/
 target/
+vendored_tokenizers/private_*

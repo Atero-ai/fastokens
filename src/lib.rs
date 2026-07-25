@@ -1,4 +1,5 @@
 pub mod added_tokens;
+pub mod chat_template;
 pub mod decoders;
 pub mod json_structs;
 pub mod models;
@@ -19,6 +20,7 @@ use serde_json::Value;
 
 pub use self::{
     added_tokens::{AddedTokenInfo, AddedTokens},
+    chat_template::{ChatTemplateOptions, ChatTemplateRenderer, apply_chat_template},
     json_structs::{
         AddedTokenConfig, DecoderConfig, DecoderKind, ModelConfig, ModelKind, NormalizerConfig,
         NormalizerKind, PostProcessorConfig, PostProcessorKind, PreTokenizerConfig,
@@ -119,6 +121,9 @@ pub enum Error {
 
     #[error("decoder error: {0}")]
     Decoder(#[from] decoders::Error),
+
+    #[error("chat template error: {0}")]
+    ChatTemplate(#[from] minijinja::Error),
 
     #[error("model error: {0}")]
     Model(String),
@@ -612,6 +617,17 @@ impl Tokenizer {
             .iter()
             .map(|ids| self.decode(ids, skip_special_tokens))
             .collect()
+    }
+
+    /// Render a HuggingFace-style chat template.
+    pub fn apply_chat_template(
+        &self,
+        chat_template: &str,
+        messages: Value,
+        options: ChatTemplateOptions,
+    ) -> Result<String, Error> {
+        chat_template::apply_chat_template(chat_template, messages, options)
+            .map_err(Error::ChatTemplate)
     }
 
     // ── Vocabulary access ────────────────────────────────────────────

@@ -93,7 +93,7 @@ jobs:
         run: maturin build --release --out dist && pip install dist/*.whl
 
       - name: Install transformers ${{ matrix.transformers }} and pytest
-        run: pip install transformers==${{ matrix.transformers }} pytest
+        run: pip install transformers==${{ matrix.transformers }} pytest jinja2
 
       - name: Test patch_transformers
         run: pytest python/tests/test_patch_transformers.py -v

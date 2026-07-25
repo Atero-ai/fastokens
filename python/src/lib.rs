@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, LazyLock, RwLock},
+    sync::{Arc, RwLock},
 };
 
+use fastokens::chat_template::minijinja::{Value as TemplateValue, value::ValueKind};
 use numpy::IntoPyArray;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -10,16 +11,6 @@ use pyo3::types::{PyAny, PyDict, PyList, PyString};
 use pyo3_async_runtimes::tokio::future_into_py;
 use rayon::prelude::*;
 use serde_json::Value;
-use tokio::runtime::Runtime;
-
-static TOKIO_RUNTIME: LazyLock<Arc<Runtime>> = LazyLock::new(|| {
-    Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create global Tokio runtime"),
-    )
-});
 
 fn extract_string_vec(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<String>> {
     if value.downcast::<PyString>().is_ok() {
@@ -27,6 +18,7 @@ fn extract_string_vec(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<Stri
             "{name} must be a sequence or set of strings, not a single string"
         )));
     }
+
     if let Ok(values) = value.extract::<Vec<String>>() {
         return Ok(values);
     }
@@ -36,6 +28,337 @@ fn extract_string_vec(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<Stri
     Err(PyTypeError::new_err(format!(
         "{name} must be a sequence or set of strings"
     )))
+}
+
+/// Convert a Python object into a `serde_json::Value` without a Python JSON
+/// serialization round-trip.
+fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    pythonize::depythonize(value)
+        .map_err(|e| PyTypeError::new_err(format!("value is not JSON-compatible: {e}")))
+}
+
+/// Convert optional Python keyword arguments into a JSON object map.
+///
+/// `None` becomes an empty map.  A provided value must be a dictionary after
+/// JSON conversion; otherwise a `TypeError` is raised.
+fn py_dict_to_json_map(
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<serde_json::Map<String, Value>> {
+    let Some(dict) = dict else {
+        return Ok(serde_json::Map::new());
+    };
+    match py_to_json(dict.as_any())? {
+        Value::Object(map) => Ok(map),
+        _ => Err(PyTypeError::new_err("expected a dictionary")),
+    }
+}
+
+fn pop_bool_context_arg(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> PyResult<Option<bool>> {
+    match map.remove(key) {
+        Some(Value::Bool(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => Err(PyTypeError::new_err(format!(
+            "{key} must be a bool, got {value}"
+        ))),
+    }
+}
+
+fn consume_render_only_tokenizer_kwargs(map: &mut serde_json::Map<String, Value>) -> PyResult<()> {
+    for key in [
+        "messages",
+        "conversation",
+        "add_generation_prompt",
+        "continue_final_message",
+        "tools",
+        "documents",
+        "special_tokens",
+    ] {
+        if map.contains_key(key) {
+            return Err(PyTypeError::new_err(format!(
+                "apply_chat_template got multiple values for keyword argument `{key}`"
+            )));
+        }
+    }
+
+    if pop_bool_context_arg(map, "return_assistant_tokens_mask")?.unwrap_or(false) {
+        return Err(PyValueError::new_err(
+            "`return_assistant_tokens_mask=True` requires `return_dict=True` and `tokenize=True`",
+        ));
+    }
+
+    if pop_bool_context_arg(map, "return_dict")?.unwrap_or(false) {
+        return Err(PyValueError::new_err(
+            "`return_dict=True` requires `tokenize=True`",
+        ));
+    }
+    for key in [
+        "padding",
+        "truncation",
+        "max_length",
+        "return_tensors",
+        "tokenizer_kwargs",
+    ] {
+        map.remove(key);
+    }
+    Ok(())
+}
+
+fn is_batched_chat(messages: &Value) -> bool {
+    messages
+        .as_array()
+        .and_then(|messages| messages.first())
+        .is_some_and(Value::is_array)
+}
+
+/// Convert a Python object straight into a MiniJinja value, skipping the
+/// intermediate `serde_json::Value` tree that `py_to_json` builds. On large
+/// conversations that second tree dominates `apply_chat_template` cost.
+fn py_to_template_value(value: &Bound<'_, PyAny>) -> PyResult<TemplateValue> {
+    pythonize::depythonize(value)
+        .map_err(|e| PyTypeError::new_err(format!("value is not JSON-compatible: {e}")))
+}
+
+/// Messages ready for rendering. `continue_final_message` needs to mutate the
+/// final message before rendering, which only the JSON representation
+/// supports; every other call takes the single-hop MiniJinja conversion.
+enum PreparedMessages {
+    Value(TemplateValue),
+    Json(Value),
+}
+
+fn is_batched_chat_value(messages: &TemplateValue) -> bool {
+    messages.kind() == ValueKind::Seq
+        && messages
+            .try_iter()
+            .ok()
+            .and_then(|mut items| items.next())
+            .is_some_and(|first| first.kind() == ValueKind::Seq)
+}
+
+/// A failed `apply_chat_template` call, split by the Python exception type it
+/// should surface as.
+enum ChatTemplateCallError {
+    /// Unknown keyword argument rejected by strict validation -> `TypeError`.
+    UnknownKwarg(String),
+    /// Template compilation or rendering failure -> `ValueError`.
+    Render(String),
+}
+
+impl From<ChatTemplateCallError> for PyErr {
+    fn from(err: ChatTemplateCallError) -> PyErr {
+        match err {
+            ChatTemplateCallError::UnknownKwarg(message) => PyTypeError::new_err(message),
+            ChatTemplateCallError::Render(message) => PyValueError::new_err(message),
+        }
+    }
+}
+
+/// An `apply_chat_template` call after all GIL-held preparation.
+///
+/// Owns no Python references, so the CPU-bound [`render`](Self::render) half
+/// can run wherever the caller likes: under `allow_threads` for the sync
+/// binding, on the Tokio blocking pool for the async one. Keeping the split
+/// here is what lets both bindings share every line except the launch.
+struct PreparedChatTemplateCall {
+    template: String,
+    renderer: Option<Arc<fastokens::ChatTemplateRenderer>>,
+    messages: PreparedMessages,
+    options: fastokens::ChatTemplateOptions,
+    continuation: Option<String>,
+    strict_template: bool,
+}
+
+impl PreparedChatTemplateCall {
+    fn render(self) -> Result<String, ChatTemplateCallError> {
+        let Self {
+            template,
+            renderer,
+            messages,
+            options,
+            continuation,
+            strict_template,
+        } = self;
+        let run = |renderer: &fastokens::ChatTemplateRenderer| {
+            if strict_template {
+                validate_template_kwargs(renderer, &options.extra_context)?;
+            }
+            match messages {
+                PreparedMessages::Value(messages) => renderer.render_value(messages, options),
+                PreparedMessages::Json(messages) => renderer.render(messages, options),
+            }
+            .map_err(|e| ChatTemplateCallError::Render(e.to_string()))
+        };
+        let rendered = match renderer {
+            Some(renderer) => run(&renderer)?,
+            None => match fastokens::ChatTemplateRenderer::new(&template) {
+                Ok(renderer) => run(&renderer)?,
+                Err(e) => return Err(ChatTemplateCallError::Render(e.to_string())),
+            },
+        };
+        match continuation {
+            Some(final_message) => trim_continue_final_message(rendered, &final_message)
+                .map_err(ChatTemplateCallError::Render),
+            None => Ok(rendered),
+        }
+    }
+}
+
+/// Reject keyword arguments the template never reads.
+///
+/// Typos like `enable_thinkng` otherwise render silently against the
+/// template's default branch, producing a wrong prompt with no signal.
+fn validate_template_kwargs(
+    renderer: &fastokens::ChatTemplateRenderer,
+    extra_context: &serde_json::Map<String, Value>,
+) -> Result<(), ChatTemplateCallError> {
+    let known = renderer.undeclared_variables();
+    for key in extra_context.keys() {
+        if !known.contains(key) {
+            let suggestion = closest_variable(key, known)
+                .map(|candidate| format!(". Did you mean `{candidate}`?"))
+                .unwrap_or_default();
+            return Err(ChatTemplateCallError::UnknownKwarg(format!(
+                "apply_chat_template got an unexpected keyword argument `{key}`: the chat \
+                 template does not reference it{suggestion} Pass \
+                 fastokens_strict_template=False to allow unused keyword arguments."
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn closest_variable<'a>(
+    key: &str,
+    candidates: &'a std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    let max_distance = 1 + key.len() / 4;
+    candidates
+        .iter()
+        .map(|candidate| (levenshtein(key, candidate), candidate))
+        .filter(|(distance, _)| *distance <= max_distance)
+        .min()
+        .map(|(_, candidate)| candidate.as_str())
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, l) in left.iter().enumerate() {
+        let mut previous_diagonal = row[0];
+        row[0] = i + 1;
+        for (j, r) in right.iter().enumerate() {
+            let substitution = previous_diagonal + usize::from(l != r);
+            previous_diagonal = row[j + 1];
+            row[j + 1] = substitution.min(row[j] + 1).min(previous_diagonal + 1);
+        }
+    }
+    row[right.len()]
+}
+
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+fn parse_continue_final_message(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(continue_final_message) = value.extract::<bool>() {
+        return Ok(continue_final_message.then(|| "content".to_string()));
+    }
+    if let Ok(field) = value.extract::<String>() {
+        return Ok((!field.is_empty()).then_some(field));
+    }
+    Err(PyTypeError::new_err(
+        "continue_final_message must be a bool or string",
+    ))
+}
+
+fn prepare_continue_final_message(
+    messages: &mut Value,
+    field: &str,
+    chat_template: &str,
+) -> PyResult<String> {
+    if !chat_template.contains(field) {
+        return Err(PyValueError::new_err(format!(
+            "continue_final_message is set to \"{field}\" but this is not an accepted field in the chat_template"
+        )));
+    }
+
+    let final_message = messages
+        .as_array_mut()
+        .and_then(|messages| messages.last_mut())
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            PyValueError::new_err("continue_final_message requires a non-empty message list")
+        })?;
+    let final_value = final_message.get_mut(field).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "continue_final_message is set but the final message has no \"{field}\" to continue"
+        ))
+    })?;
+
+    match final_value {
+        Value::String(content) => {
+            let original = content.clone();
+            content.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+            Ok(original)
+        }
+        Value::Array(blocks) => {
+            for block in blocks.iter_mut().rev() {
+                if let Some(text_value) = block
+                    .as_object_mut()
+                    .and_then(|block| block.get_mut("text"))
+                {
+                    if let Some(text) = text_value.as_str().map(str::to_string) {
+                        *text_value = Value::String(format!("{text}{CONTINUE_FINAL_MESSAGE_TAG}"));
+                        return Ok(text);
+                    }
+                }
+            }
+            Err(PyValueError::new_err(
+                "continue_final_message is set but we could not find any text to continue in the final message",
+            ))
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "continue_final_message is set but final message field \"{field}\" is not a string or text block list"
+        ))),
+    }
+}
+
+fn trim_continue_final_message(rendered: String, final_message: &str) -> Result<String, String> {
+    let final_message = final_message.trim();
+    let tag = CONTINUE_FINAL_MESSAGE_TAG.trim();
+    if !rendered.contains(final_message) || !rendered.contains(tag) {
+        let final_message = truncate_for_error(final_message, 512);
+        let truncated = truncate_for_error(&rendered, 4096);
+        return Err(format!(
+            "continue_final_message is set but the final message does not appear in the chat after applying the chat template. Final message to continue: {final_message}\nRendered chat:\n{truncated}"
+        ));
+    }
+    let tag_loc = rendered
+        .rfind(tag)
+        .expect("tag presence was checked before rfind");
+    if rendered[tag_loc..].starts_with(CONTINUE_FINAL_MESSAGE_TAG) {
+        Ok(rendered[..tag_loc].to_string())
+    } else {
+        Ok(rendered[..tag_loc].trim_end().to_string())
+    }
+}
+
+fn truncate_for_error(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +790,9 @@ struct TokenizerState {
     pad: Option<PaddingParams>,
     /// Cached JSON of the current post-processor (for the getter).
     post_processor_json: Option<String>,
+    chat_template: Option<String>,
+    chat_template_renderer: Option<Arc<fastokens::ChatTemplateRenderer>>,
+    special_tokens: serde_json::Map<String, Value>,
 }
 
 impl TokenizerState {
@@ -593,6 +919,103 @@ impl PyTokenizer {
         self.state.write().expect("PyTokenizer state lock poisoned")
     }
 
+    /// GIL-held half of `apply_chat_template`, shared by the sync and async
+    /// bindings: validate arguments, convert Python inputs to owned Rust
+    /// values, and resolve the template. The returned call owns everything
+    /// the CPU-bound render needs, so the bindings differ only in where they
+    /// run it.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_chat_template_call(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        chat_template: Option<String>,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        continue_final_message: Option<Py<PyAny>>,
+        tools: Option<&Bound<'_, PyAny>>,
+        documents: Option<&Bound<'_, PyAny>>,
+        special_tokens: Option<&Bound<'_, PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PreparedChatTemplateCall> {
+        if tokenize {
+            return Err(PyNotImplementedError::new_err(
+                "apply_chat_template(tokenize=True) is not supported by fastokens; render with tokenize=False and call encode separately",
+            ));
+        }
+
+        let continue_field = parse_continue_final_message(
+            continue_final_message.as_ref().map(|value| value.bind(py)),
+        )?;
+        if add_generation_prompt && continue_field.is_some() {
+            return Err(PyValueError::new_err(
+                "continue_final_message and add_generation_prompt are not compatible",
+            ));
+        }
+
+        let mut messages = if continue_field.is_some() {
+            PreparedMessages::Json(py_to_json(messages)?)
+        } else {
+            PreparedMessages::Value(py_to_template_value(messages)?)
+        };
+        let batched = match &messages {
+            PreparedMessages::Json(messages) => is_batched_chat(messages),
+            PreparedMessages::Value(messages) => is_batched_chat_value(messages),
+        };
+        if batched {
+            return Err(PyNotImplementedError::new_err(
+                "batched conversations are not supported by fastokens apply_chat_template",
+            ));
+        }
+        let tools = tools.map(py_to_json).transpose()?;
+        let documents = documents.map(py_to_json).transpose()?;
+        let per_call_special_tokens = py_dict_to_json_map(special_tokens)?;
+        let mut extra_context = py_dict_to_json_map(kwargs)?;
+        consume_render_only_tokenizer_kwargs(&mut extra_context)?;
+        let strict_template =
+            pop_bool_context_arg(&mut extra_context, "fastokens_strict_template")?.unwrap_or(true);
+
+        let state = self.read();
+        let (template, renderer) = match chat_template {
+            Some(template) => (template, None),
+            None => {
+                let template = state
+                    .chat_template
+                    .clone()
+                    .ok_or_else(|| PyValueError::new_err("chat_template must be provided"))?;
+                let renderer = state
+                    .chat_template_renderer
+                    .clone()
+                    .ok_or_else(|| PyValueError::new_err("chat_template must be provided"))?;
+                (template, Some(renderer))
+            }
+        };
+        let continuation = match (&continue_field, &mut messages) {
+            (Some(field), PreparedMessages::Json(messages)) => {
+                Some(prepare_continue_final_message(messages, field, &template)?)
+            }
+            _ => None,
+        };
+        let mut options = fastokens::ChatTemplateOptions {
+            add_generation_prompt,
+            continue_final_message: continue_field.is_some(),
+            tools,
+            documents,
+            special_tokens: state.special_tokens.clone(),
+            extra_context,
+        };
+        options.special_tokens.extend(per_call_special_tokens);
+
+        Ok(PreparedChatTemplateCall {
+            template,
+            renderer,
+            messages,
+            options,
+            continuation,
+            strict_template,
+        })
+    }
+
     /// Build from a raw JSON string, extracting the post-processor field so
     /// the getter can return it without needing to re-serialize.
     fn build_from_str(json: &str, py: Python<'_>) -> PyResult<Self> {
@@ -611,6 +1034,9 @@ impl PyTokenizer {
                 trunc: None,
                 pad: None,
                 post_processor_json,
+                chat_template: None,
+                chat_template_renderer: None,
+                special_tokens: fastokens::chat_template::default_special_tokens(),
             })),
         })
     }
@@ -651,6 +1077,145 @@ impl PyTokenizer {
             })
             .map_err(PyValueError::new_err)?;
         Self::build_from_str(&json, py)
+    }
+
+    /// Set the default chat template used by `apply_chat_template`.
+    fn set_chat_template(&self, chat_template: Option<String>) -> PyResult<()> {
+        let renderer = chat_template
+            .as_deref()
+            .map(fastokens::ChatTemplateRenderer::new)
+            .transpose()
+            .map(|renderer| renderer.map(Arc::new))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let mut state = self.write();
+        state.chat_template = chat_template;
+        state.chat_template_renderer = renderer;
+        Ok(())
+    }
+
+    /// Variables the configured chat template reads from the render context,
+    /// or ``None`` if no chat template is set.
+    ///
+    /// Derived statically from the template, so dynamic lookups are invisible.
+    /// Useful for validating or documenting per-model template kwargs.
+    #[getter]
+    fn chat_template_variables(&self) -> Option<Vec<String>> {
+        let state = self.read();
+        let renderer = state.chat_template_renderer.as_ref()?;
+        let mut variables: Vec<String> = renderer.undeclared_variables().iter().cloned().collect();
+        variables.sort();
+        Some(variables)
+    }
+
+    /// Set persistent special-token variables used by `apply_chat_template`.
+    fn set_special_tokens(&self, special_tokens: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        let special_tokens = match special_tokens {
+            Some(special_tokens) => py_dict_to_json_map(Some(special_tokens))?,
+            None => fastokens::chat_template::default_special_tokens(),
+        };
+
+        let mut state = self.write();
+        state.special_tokens = special_tokens;
+        Ok(())
+    }
+
+    /// Render a HuggingFace-style chat template.
+    #[pyo3(signature = (
+        messages,
+        chat_template = None,
+        tokenize = false,
+        add_generation_prompt = false,
+        continue_final_message = None,
+        add_special_tokens = false,
+        tools = None,
+        documents = None,
+        special_tokens = None,
+        **kwargs
+    ))]
+    fn apply_chat_template(
+        &self,
+        messages: &Bound<'_, PyAny>,
+        chat_template: Option<String>,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        continue_final_message: Option<Py<PyAny>>,
+        add_special_tokens: bool,
+        tools: Option<&Bound<'_, PyAny>>,
+        documents: Option<&Bound<'_, PyAny>>,
+        special_tokens: Option<&Bound<'_, PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let _ = add_special_tokens;
+        let call = self.prepare_chat_template_call(
+            py,
+            messages,
+            chat_template,
+            tokenize,
+            add_generation_prompt,
+            continue_final_message,
+            tools,
+            documents,
+            special_tokens,
+            kwargs,
+        )?;
+        let rendered = py.allow_threads(|| call.render()).map_err(PyErr::from)?;
+        Ok(rendered.into_pyobject(py)?.unbind().into_any())
+    }
+
+    /// Render a HuggingFace-style chat template without blocking the event
+    /// loop: returns an awaitable that renders on a background thread.
+    ///
+    /// Input conversion still happens synchronously at call time (it reads
+    /// live Python objects); only the render is offloaded.
+    #[pyo3(signature = (
+        messages,
+        chat_template = None,
+        tokenize = false,
+        add_generation_prompt = false,
+        continue_final_message = None,
+        add_special_tokens = false,
+        tools = None,
+        documents = None,
+        special_tokens = None,
+        **kwargs
+    ))]
+    fn async_apply_chat_template<'py>(
+        &self,
+        messages: &Bound<'py, PyAny>,
+        chat_template: Option<String>,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        continue_final_message: Option<Py<PyAny>>,
+        add_special_tokens: bool,
+        tools: Option<&Bound<'py, PyAny>>,
+        documents: Option<&Bound<'py, PyAny>>,
+        special_tokens: Option<&Bound<'py, PyDict>>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = add_special_tokens;
+        let call = self.prepare_chat_template_call(
+            py,
+            messages,
+            chat_template,
+            tokenize,
+            add_generation_prompt,
+            continue_final_message,
+            tools,
+            documents,
+            special_tokens,
+            kwargs,
+        )?;
+        future_into_py(py, async move {
+            let rendered = pyo3_async_runtimes::tokio::get_runtime()
+                .spawn_blocking(move || call.render())
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+                .map_err(PyErr::from)?;
+            Python::with_gil(|py| Ok(rendered.into_pyobject(py)?.unbind().into_any()))
+        })
     }
 
     // ── Post-processor ────────────────────────────────────────────────
@@ -925,10 +1490,9 @@ impl PyTokenizer {
         split_special_tokens: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let rt = Arc::clone(&TOKIO_RUNTIME);
 
         future_into_py(py, async move {
-            let encodings = rt
+            let encodings = pyo3_async_runtimes::tokio::get_runtime()
                 .spawn_blocking(move || {
                     let state = state.read().expect("PyTokenizer state lock poisoned");
                     state.encode_batch_encodings(&inputs, add_special_tokens, split_special_tokens)
@@ -1032,10 +1596,9 @@ impl PyTokenizer {
         skip_special_tokens: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let rt = Arc::clone(&TOKIO_RUNTIME);
 
         future_into_py(py, async move {
-            let decoded = rt
+            let decoded = pyo3_async_runtimes::tokio::get_runtime()
                 .spawn_blocking(move || {
                     let state = state.read().expect("PyTokenizer state lock poisoned");
                     let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();

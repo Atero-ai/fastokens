@@ -48,6 +48,8 @@ class _TokenizerShim:
             self._json = src._json
             self._fast = Tokenizer.from_json_str(src._json)
             self._encode_special_tokens = src._encode_special_tokens
+            self._chat_template = src._chat_template
+            self._special_tokens = getattr(src, "_special_tokens", None)
         elif hasattr(src, "to_str"):
             # Accept a real tokenizers.Tokenizer (e.g. from convert_slow_tokenizer).
             self._json = src.to_str()
@@ -60,6 +62,15 @@ class _TokenizerShim:
             )
         if not hasattr(self, "_encode_special_tokens"):
             self._encode_special_tokens = False
+        if not hasattr(self, "_chat_template"):
+            self._chat_template = None
+        if not hasattr(self, "_native_chat_template"):
+            self._native_chat_template = None
+        if not hasattr(self, "_special_tokens"):
+            self._special_tokens = None
+        self._set_native_chat_template(self._chat_template)
+        if self._special_tokens is not None:
+            self._fast.set_special_tokens(self._special_tokens)
 
     # -- Pickle / copy --------------------------------------------------
 
@@ -69,6 +80,8 @@ class _TokenizerShim:
             self._fast.truncation,
             self._fast.padding,
             self._encode_special_tokens,
+            self._chat_template,
+            self._special_tokens,
         )
 
     def __setstate__(self, state) -> None:
@@ -76,7 +89,14 @@ class _TokenizerShim:
             # Backwards compat: old pickles stored just the JSON string.
             self.__init__(state)  # type: ignore[misc]
         else:
-            json_str, trunc, pad, enc_special = state
+            special_tokens = None
+            if len(state) == 4:
+                json_str, trunc, pad, enc_special = state
+                chat_template = None
+            elif len(state) == 5:
+                json_str, trunc, pad, enc_special, chat_template = state
+            else:
+                json_str, trunc, pad, enc_special, chat_template, special_tokens = state
             self.__init__(json_str)  # type: ignore[misc]
             if trunc is not None:
                 self._fast.enable_truncation(**trunc)
@@ -85,6 +105,11 @@ class _TokenizerShim:
                     **{k: v for k, v in pad.items() if v is not None}
                 )
             self.encode_special_tokens = enc_special
+            self._chat_template = chat_template
+            self._native_chat_template = None
+            self._set_native_chat_template(chat_template)
+            if special_tokens is not None:
+                self.set_special_tokens(special_tokens)
 
     def __deepcopy__(self, memo):
         new = object.__new__(_TokenizerShim)
@@ -98,6 +123,12 @@ class _TokenizerShim:
         if pad is not None:
             new._fast.enable_padding(**{k: v for k, v in pad.items() if v is not None})
         new._encode_special_tokens = self._encode_special_tokens
+        new._chat_template = self._chat_template
+        new._native_chat_template = None
+        new._set_native_chat_template(new._chat_template)
+        new._special_tokens = dict(self._special_tokens) if self._special_tokens else None
+        if new._special_tokens is not None:
+            new._fast.set_special_tokens(new._special_tokens)
         if hasattr(self, "_special_prefix"):
             new._special_prefix = list(self._special_prefix)
             new._special_suffix = list(self._special_suffix)
@@ -319,6 +350,77 @@ class _TokenizerShim:
             segments,
             add_special_tokens=add_special_tokens,
             tiktoken_safe=tiktoken_safe,
+        )
+
+    def set_chat_template(self, chat_template: str | None) -> None:
+        self._chat_template = chat_template
+        self._set_native_chat_template(chat_template)
+
+    def set_special_tokens(self, special_tokens: dict | None) -> None:
+        self._special_tokens = dict(special_tokens) if special_tokens is not None else None
+        self._fast.set_special_tokens(special_tokens)
+
+    def _set_native_chat_template(self, chat_template: str | None) -> None:
+        if self._native_chat_template != chat_template:
+            self._fast.set_chat_template(chat_template)
+            self._native_chat_template = chat_template
+
+    def apply_chat_template(
+        self,
+        messages,
+        chat_template: str | None = None,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool | str = False,
+        add_special_tokens: bool = False,
+        tools=None,
+        documents=None,
+        special_tokens=None,
+        **kwargs,
+    ):
+        """Render a HuggingFace-style chat template using the Rust backend."""
+        if chat_template is None:
+            self._set_native_chat_template(self._chat_template)
+        return self._fast.apply_chat_template(
+            messages,
+            chat_template=chat_template,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=continue_final_message,
+            add_special_tokens=add_special_tokens,
+            tools=tools,
+            documents=documents,
+            special_tokens=special_tokens,
+            **kwargs,
+        )
+
+    async def async_apply_chat_template(
+        self,
+        messages,
+        chat_template: str | None = None,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool | str = False,
+        add_special_tokens: bool = False,
+        tools=None,
+        documents=None,
+        special_tokens=None,
+        **kwargs,
+    ):
+        """Render a chat template on a background thread; awaitable."""
+        if chat_template is None:
+            self._set_native_chat_template(self._chat_template)
+        return await self._fast.async_apply_chat_template(
+            messages,
+            chat_template=chat_template,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=continue_final_message,
+            add_special_tokens=add_special_tokens,
+            tools=tools,
+            documents=documents,
+            special_tokens=special_tokens,
+            **kwargs,
         )
 
     async def async_encode_batch(

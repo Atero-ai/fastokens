@@ -1,0 +1,295 @@
+mod runtime;
+mod special_tokens;
+
+use minijinja::Error as MiniJinjaError;
+use serde_json::{Map, Value};
+
+pub use runtime::ChatTemplateRenderer;
+pub use special_tokens::default_special_tokens;
+
+// Re-exported so bindings can deserialize directly into the same
+// `minijinja::Value` the renderer consumes (see `ChatTemplateRenderer::render_value`)
+// without depending on a possibly-mismatched minijinja version themselves.
+pub use minijinja;
+
+/// Options for rendering a HuggingFace-style chat template.
+#[derive(Clone, Debug, Default)]
+pub struct ChatTemplateOptions {
+    pub add_generation_prompt: bool,
+    pub continue_final_message: bool,
+    pub tools: Option<Value>,
+    pub documents: Option<Value>,
+    pub special_tokens: Map<String, Value>,
+    pub extra_context: Map<String, Value>,
+}
+
+/// Render a HuggingFace-style Jinja chat template.
+///
+/// This covers the hot serving path for `apply_chat_template(..., tokenize=False)`.
+/// Python bindings can tokenize the rendered string directly afterward, avoiding
+/// the Python-side template loop while keeping the tokenizer API surface small.
+pub fn apply_chat_template(
+    chat_template: &str,
+    messages: Value,
+    options: ChatTemplateOptions,
+) -> Result<String, MiniJinjaError> {
+    ChatTemplateRenderer::new(chat_template)?.render(messages, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn renders_common_hf_style_template() {
+        let template = r#"
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}
+{{ bos_token }}user: {{ message['content'] }}{{ eos_token }}
+{%- elif message['role'] == 'assistant' -%}
+assistant: {{ message.get('content') }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}assistant:{%- endif -%}
+"#;
+        let messages = json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"}
+        ]);
+        let special_tokens = Map::from_iter([
+            ("bos_token".to_string(), json!("[BOS]")),
+            ("eos_token".to_string(), json!("[EOS]")),
+        ]);
+        let options = ChatTemplateOptions {
+            add_generation_prompt: true,
+            special_tokens,
+            ..Default::default()
+        };
+
+        let rendered = apply_chat_template(template, messages, options).unwrap();
+
+        assert_eq!(rendered, "[BOS]user: hello[EOS]assistant: hiassistant:");
+    }
+
+    #[test]
+    fn omits_null_special_tokens_from_context() {
+        let mut special_tokens = default_special_tokens();
+        special_tokens.insert("custom_token".to_string(), Value::Null);
+
+        let rendered = apply_chat_template(
+            "{% if pad_token is defined %}defined{% else %}undefined{% endif %}{{ pad_token }}",
+            json!([]),
+            ChatTemplateOptions {
+                special_tokens,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "undefined");
+    }
+
+    #[test]
+    fn supports_tools_documents_tojson_and_kwargs() {
+        let template = r#"{{ tools[0].name }} {{ documents[0].title }} {{ custom | tojson }}"#;
+        let mut extra = Map::new();
+        extra.insert("custom".to_string(), json!({"x": 1}));
+        let options = ChatTemplateOptions {
+            tools: Some(json!([{"name": "search"}])),
+            documents: Some(json!([{"title": "doc"}])),
+            extra_context: extra,
+            ..Default::default()
+        };
+
+        let rendered = apply_chat_template(template, json!([]), options).unwrap();
+
+        assert_eq!(rendered, r#"search doc {"x": 1}"#);
+    }
+
+    #[test]
+    fn supports_python_compat_methods() {
+        let template = r#"{{ message.get('missing', 'fallback') }} {{ 'abc'.upper() }} {{ [1, 1, 2].count(1) }}"#;
+        let mut extra = Map::new();
+        extra.insert("message".to_string(), json!({"content": "hello"}));
+
+        let rendered = apply_chat_template(
+            template,
+            json!([]),
+            ChatTemplateOptions {
+                extra_context: extra,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "fallback ABC 2");
+    }
+
+    #[test]
+    fn tojson_matches_transformers_defaults() {
+        let template = r#"{{ value | tojson }}"#;
+        let mut extra = Map::new();
+        extra.insert("value".to_string(), json!({"text": "<tag>&'"}));
+
+        let rendered = apply_chat_template(
+            template,
+            json!([]),
+            ChatTemplateOptions {
+                extra_context: extra,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered, r#"{"text": "<tag>&'"}"#);
+    }
+
+    #[test]
+    fn tojson_supports_compact_separators_and_ascii_escape() {
+        let template = r#"{{ value | tojson(separators=(',', ':'), ensure_ascii=True) }}"#;
+        let mut extra = Map::new();
+        extra.insert("value".to_string(), json!({"text": "é"}));
+
+        let rendered = apply_chat_template(
+            template,
+            json!([]),
+            ChatTemplateOptions {
+                extra_context: extra,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered, r#"{"text":"\u00e9"}"#);
+    }
+
+    #[test]
+    fn strips_generation_markers() {
+        let rendered = apply_chat_template(
+            "a{% generation %}b{% endgeneration %}c",
+            json!([]),
+            ChatTemplateOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "abc");
+    }
+
+    #[test]
+    fn rewrites_generation_markers_with_whitespace_control() {
+        let rendered = apply_chat_template(
+            "a\n{%- generation -%}\nb\n{%- endgeneration -%}\nc",
+            json!([]),
+            ChatTemplateOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "abc");
+    }
+
+    #[test]
+    fn tojson_indent_matches_json_dumps() {
+        let mut extra = Map::new();
+        extra.insert("value".to_string(), json!({"b": [1, 2], "a": {}, "c": "x"}));
+
+        let rendered = apply_chat_template(
+            "{{ value | tojson(indent=2) }}",
+            json!([]),
+            ChatTemplateOptions {
+                extra_context: extra,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // json.dumps(value, indent=2)
+        assert_eq!(
+            rendered,
+            "{\n  \"b\": [\n    1,\n    2\n  ],\n  \"a\": {},\n  \"c\": \"x\"\n}"
+        );
+    }
+
+    #[test]
+    fn tojson_indent_honors_separators() {
+        let mut extra = Map::new();
+        extra.insert("value".to_string(), json!({"b": [1, 2], "a": {}, "c": "x"}));
+
+        let rendered = apply_chat_template(
+            "{{ value | tojson(indent=2, separators=(',', ':')) }}",
+            json!([]),
+            ChatTemplateOptions {
+                extra_context: extra,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // json.dumps(value, indent=2, separators=(",", ":"))
+        assert_eq!(
+            rendered,
+            "{\n  \"b\":[\n    1,\n    2\n  ],\n  \"a\":{},\n  \"c\":\"x\"\n}"
+        );
+    }
+
+    #[test]
+    fn tojson_indent_keeps_separator_whitespace_like_json_dumps() {
+        let mut extra = Map::new();
+        extra.insert("value".to_string(), json!({"b": [1, 2], "a": {}, "c": "x"}));
+
+        let rendered = apply_chat_template(
+            "{{ value | tojson(indent=2, separators=(', ', ': '), sort_keys=True) }}",
+            json!([]),
+            ChatTemplateOptions {
+                extra_context: extra,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // json.dumps keeps the item separator verbatim before the newline,
+        // trailing space included.
+        assert_eq!(
+            rendered,
+            "{\n  \"a\": {}, \n  \"b\": [\n    1, \n    2\n  ], \n  \"c\": \"x\"\n}"
+        );
+    }
+
+    #[test]
+    fn exposes_undeclared_template_variables() {
+        let renderer = ChatTemplateRenderer::new(
+            "{% for m in messages %}{{ m.content }}{% endfor %}{% if enable_thinking %}t{% endif %}",
+        )
+        .unwrap();
+
+        let variables = renderer.undeclared_variables();
+
+        assert!(variables.contains("messages"));
+        assert!(variables.contains("enable_thinking"));
+        assert!(!variables.contains("m"));
+    }
+
+    #[test]
+    fn raise_exception_returns_error() {
+        let err = apply_chat_template(
+            "{{ raise_exception('bad role') }}",
+            json!([]),
+            ChatTemplateOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("bad role"));
+    }
+
+    #[test]
+    fn strftime_now_invalid_format_returns_error() {
+        let err = apply_chat_template(
+            "{{ strftime_now('%Q %#z') }}",
+            json!([]),
+            ChatTemplateOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid strftime_now format"));
+    }
+}

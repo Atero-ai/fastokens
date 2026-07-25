@@ -176,6 +176,53 @@ class Tokenizer:
         """
         ...
 
+    def set_chat_template(self, chat_template: Optional[str]) -> None: ...
+    def set_special_tokens(self, special_tokens: Optional[dict[str, object]]) -> None: ...
+
+    @property
+    def chat_template_variables(self) -> Optional[list[str]]:
+        """Variables the configured chat template reads from the render context.
+
+        Derived statically from the template AST; ``None`` when no chat
+        template is set. Keyword arguments to ``apply_chat_template`` outside
+        this set are rejected unless ``fastokens_strict_template=False``.
+        """
+        ...
+
+    def apply_chat_template(
+        self,
+        messages: list[dict],
+        chat_template: Optional[str] = None,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool | str = False,
+        add_special_tokens: bool = False,
+        tools: Optional[list[dict]] = None,
+        documents: Optional[list[dict]] = None,
+        special_tokens: Optional[dict[str, object]] = None,
+        **kwargs,
+    ) -> str: ...
+    async def async_apply_chat_template(
+        self,
+        messages: list[dict],
+        chat_template: Optional[str] = None,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool | str = False,
+        add_special_tokens: bool = False,
+        tools: Optional[list[dict]] = None,
+        documents: Optional[list[dict]] = None,
+        special_tokens: Optional[dict[str, object]] = None,
+        **kwargs,
+    ) -> str:
+        """Like ``apply_chat_template`` but renders on a background thread.
+
+        Input conversion still runs synchronously at call time; only the
+        template render is offloaded, so awaiting this keeps large renders
+        off the event loop.
+        """
+        ...
+
     async def async_encode_batch(
         self,
         inputs: list[str],

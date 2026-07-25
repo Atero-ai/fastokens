@@ -807,6 +807,46 @@ impl PyTokenizer {
         Py::new(py, encoding)
     }
 
+    /// Encode text segments with per-segment control over added-token matching.
+    ///
+    /// Each segment is ``(text, allow_special)``. When ``allow_special`` is
+    /// false, all added-token matching is bypassed for that segment, matching
+    /// ``tiktoken.encode(..., disallowed_special=())`` for user/tool text.
+    ///
+    /// ``tiktoken_safe=True`` is the default and reproduces legacy tiktoken
+    /// tokenizer chunking for token-ID parity. Pass ``False`` only when you
+    /// explicitly want whole-segment BPE encoding.
+    #[pyo3(signature = (segments, add_special_tokens = false, tiktoken_safe = true))]
+    fn encode_segments(
+        &self,
+        segments: Vec<(String, bool)>,
+        add_special_tokens: bool,
+        tiktoken_safe: bool,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyEncoding>> {
+        let encoding = py
+            .allow_threads(|| {
+                let state = self.read();
+                let segment_iter = segments.iter().map(|(text, allow)| (text, *allow));
+                let mut ids = if tiktoken_safe {
+                    state
+                        .inner
+                        .encode_segments_tiktoken_safe(segment_iter, add_special_tokens)
+                } else {
+                    state
+                        .inner
+                        .encode_segments(segment_iter, add_special_tokens)
+                }
+                .map_err(|e| e.to_string())?;
+                state.do_truncate(&mut ids);
+                let target = state.single_pad_target(ids.len());
+                Ok::<PyEncoding, String>(build_encoding(ids, state.pad.as_ref(), target))
+            })
+            .map_err(PyValueError::new_err)?;
+
+        Py::new(py, encoding)
+    }
+
     /// Encode a rendered prompt containing structural token strings.
     ///
     /// Structural tokens are emitted as token IDs. Text spans are encoded with

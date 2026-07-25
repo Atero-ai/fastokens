@@ -10,7 +10,11 @@ import types
 
 import pytest
 
-from fastokens import Tokenizer, tiktoken_model_to_tokenizer_json, tiktoken_to_tokenizer_json
+from fastokens import (
+    Tokenizer,
+    tiktoken_model_to_tokenizer_json,
+    tiktoken_to_tokenizer_json,
+)
 
 VENDORED_DIR = Path(__file__).parents[2] / "vendored_tokenizers"
 
@@ -75,10 +79,14 @@ def test_tiktoken_to_tokenizer_json_matches_encoding() -> None:
         "abc!",
     ]
     for text in texts:
-        assert tokenizer.encode(text, add_special_tokens=False).ids == encoding.encode(text)
+        assert tokenizer.encode(text, add_special_tokens=False).ids == encoding.encode(
+            text
+        )
 
 
-def test_tiktoken_to_tokenizer_json_with_encoding_name(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tiktoken_to_tokenizer_json_with_encoding_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tiktoken = pytest.importorskip("tiktoken")
     encoding = _create_test_encoding()
     monkeypatch.setattr(tiktoken, "get_encoding", lambda name: encoding)
@@ -130,7 +138,9 @@ def test_tiktoken_model_to_tokenizer_json_matches_model_file(tmp_path) -> None:
     tokenizer = Tokenizer.from_json_str(tokenizer_json)
 
     for text in ["abcd", "ab cd", "abc!"]:
-        assert tokenizer.encode(text, add_special_tokens=False).ids == encoding.encode(text)
+        assert tokenizer.encode(text, add_special_tokens=False).ids == encoding.encode(
+            text
+        )
     assert tokenizer.encode("<|end|>", add_special_tokens=False).ids == [100]
 
 
@@ -261,7 +271,10 @@ def test_kimi_k2_5_config_conversion_preserves_reserved_added_token_range(
     assert added_by_id[163606]["special"] is False
     assert added_by_id[163838]["content"] == "[UNK]"
     assert added_by_id[163839]["content"] == "[PAD]"
-    assert config["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] == vendored_pattern
+    assert (
+        config["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
+        == vendored_pattern
+    )
 
 
 def test_kimi_k2_5_conversion_encode_matches_hf_tokenizers(tmp_path) -> None:
@@ -361,7 +374,9 @@ def test_tiktoken_model_to_tokenizer_json_raises_for_invalid_file(tmp_path) -> N
         tiktoken_model_to_tokenizer_json(model_path)
 
 
-def test_kimi_k2_5_tiktoken_gz_conversion_matches_vendored_tokenizer_json(tmp_path) -> None:
+def test_kimi_k2_5_tiktoken_gz_conversion_matches_vendored_tokenizer_json(
+    tmp_path,
+) -> None:
     """Convert the vendored Kimi K2.5 tiktoken.model.gz on the fly and verify
     that encoding results match the vendored tokenizer.json for a corpus of
     test strings. Requires tiktoken; skipped otherwise."""
@@ -383,9 +398,7 @@ def test_kimi_k2_5_tiktoken_gz_conversion_matches_vendored_tokenizer_json(tmp_pa
     vendored = json.loads(vendored_json_path.read_text())
     pattern: str = vendored["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
     special_tokens: dict[str, int] = {
-        t["content"]: t["id"]
-        for t in vendored["added_tokens"]
-        if t.get("special")
+        t["content"]: t["id"] for t in vendored["added_tokens"] if t.get("special")
     }
 
     # Convert the tiktoken model to a tokenizer JSON and build a Tokenizer.
@@ -408,7 +421,9 @@ def test_kimi_k2_5_tiktoken_gz_conversion_matches_vendored_tokenizer_json(tmp_pa
     assert len(converted_model["vocab"]) == len(vendored_model["vocab"])
     assert converted_model["vocab"] == vendored_model["vocab"]
     assert len(converted_model["merges"]) == len(vendored_model["merges"])
-    assert _merge_counter(converted_model["merges"]) == _merge_counter(vendored_model["merges"])
+    assert _merge_counter(converted_model["merges"]) == _merge_counter(
+        vendored_model["merges"]
+    )
 
     converted_special_tokens = _special_token_map(converted["added_tokens"])
     vendored_special_tokens = _special_token_map(vendored["added_tokens"])
@@ -429,3 +444,31 @@ def test_kimi_k2_5_tiktoken_gz_conversion_matches_vendored_tokenizer_json(tmp_pa
             f"  converted : {converted_ids}\n"
             f"  vendored  : {vendored_ids}"
         )
+
+
+def test_converted_tiktoken_tokenizer_encodes_segments_with_special_control() -> None:
+    encoding = _create_test_encoding()
+    tokenizer = Tokenizer.from_json_str(tiktoken_to_tokenizer_json(encoding))
+
+    structural_ids = tokenizer.encode_segments(
+        [("ab", False), ("<|end|>", True), ("cd", False)]
+    ).ids
+    text_ids = tokenizer.encode_segments([("ab cd", False)]).ids
+
+    assert structural_ids == [4, 100, 5]
+    assert text_ids == encoding.encode("ab cd", disallowed_special=())
+
+
+def test_converted_tiktoken_tokenizer_tiktoken_safe_segments_match_manual_chunks() -> (
+    None
+):
+    encoding = _create_test_encoding()
+    tokenizer = Tokenizer.from_json_str(tiktoken_to_tokenizer_json(encoding))
+    text = "aaaa"
+
+    safe_ids = tokenizer.encode_segments(
+        [(text, False)],
+        tiktoken_safe=True,
+    ).ids
+
+    assert safe_ids == encoding.encode(text, disallowed_special=())

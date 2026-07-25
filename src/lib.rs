@@ -36,6 +36,14 @@ use self::{
     pre_tokenized::{PreTokenizedString, Split as PtSplit},
 };
 
+// Upper bound a single tiktoken `encode` call can handle without the regex
+// pre-tokenizer panicking across the pyo3 boundary (`pyo3_runtime.
+// PanicException`). Legacy tiktoken tokenizers chunk inputs at this size.
+const TIKTOKEN_MAX_ENCODE_CHARS: usize = 400_000;
+// Guard against catastrophic backtracking in tiktoken's regex on very long
+// whitespace or non-whitespace runs (tiktoken issue #195).
+const TIKTOKEN_MAX_CONSECUTIVE_WHITESPACE_OR_NONWHITESPACE_CHARS: usize = 25_000;
+
 #[cfg(feature = "hf-hub")]
 mod hf_hub_support {
     pub use hf_hub::api::sync::ApiError;
@@ -289,18 +297,37 @@ impl Tokenizer {
             };
         }
 
+        let ids = self.encode_without_post_process(input, split_special_tokens, false)?;
+
+        // 4. Post-process.
+        Ok(self.post_process(ids, add_special_tokens))
+    }
+
+    fn encode_without_post_process(
+        &self,
+        input: &str,
+        split_special_tokens: bool,
+        bypass_added_tokens: bool,
+    ) -> Result<Vec<u32>, Error> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // 1. Split on added tokens + normalize into a single buffer.
-        let mut pts = self.build_pre_tokenized_with_options(input, split_special_tokens);
+        let mut pts = self.build_pre_tokenized_with_added_token_options(
+            input,
+            split_special_tokens,
+            bypass_added_tokens,
+        );
 
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
             split.pre_tokenize(&mut pts)?;
-            let ids = pts
+            return pts
                 .tokenize_batched(|buf, splits, out| {
                     self.model.tokenize_batch_fused(buf, splits, out)
                 })
-                .map_err(Error::Model)?;
-            return Ok(self.post_process(ids, add_special_tokens));
+                .map_err(Error::Model);
         }
 
         // 2. Pre-tokenize (refine splits in place).
@@ -313,7 +340,70 @@ impl Tokenizer {
             .tokenize(|text, out| self.model.tokenize_into(text, out))
             .map_err(Error::Model)?;
 
-        // 4. Post-process.
+        Ok(ids)
+    }
+
+    /// Encode already-rendered text segments with per-segment control over
+    /// added-token matching.
+    ///
+    /// When `allow_special` is true, the segment uses normal added-token
+    /// matching. When false, all added-token matching is bypassed, so strings
+    /// like a control-token string inside user text are encoded as ordinary BPE
+    /// text.
+    /// Post-processing is applied once after all segment IDs are concatenated.
+    pub fn encode_segments<I, S>(
+        &self,
+        segments: I,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, Error>
+    where
+        I: IntoIterator<Item = (S, bool)>,
+        S: AsRef<str>,
+    {
+        let mut ids = Vec::new();
+        for (text, allow_special) in segments {
+            ids.extend(self.encode_without_post_process(text.as_ref(), false, !allow_special)?);
+        }
+        Ok(self.post_process(ids, add_special_tokens))
+    }
+
+    /// Encode segments while preserving custom tiktoken tokenizer chunking.
+    ///
+    /// This splits every segment into at most 400k-character chunks and further
+    /// splits very long whitespace/non-whitespace runs at 25k characters before
+    /// BPE encoding. Legacy tiktoken tokenizers use those limits to avoid
+    /// tiktoken regex pre-tokenizer panics/pathologies. fastokens does not need
+    /// them for robustness, but the artificial boundaries affect BPE merges, so
+    /// callers migrating from those tokenizers need this path for exact parity on
+    /// very long inputs.
+    pub fn encode_segments_tiktoken_safe<I, S>(
+        &self,
+        segments: I,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, Error>
+    where
+        I: IntoIterator<Item = (S, bool)>,
+        S: AsRef<str>,
+    {
+        let mut ids = Vec::new();
+        for (text, allow_special) in segments {
+            let text = text.as_ref();
+            let chunks = tiktoken_safe_chunks(text);
+            if chunks.len() <= 1 {
+                for chunk in chunks {
+                    ids.extend(self.encode_without_post_process(chunk, false, !allow_special)?);
+                }
+                continue;
+            }
+
+            let chunk_ids = chunks
+                .par_iter()
+                .map(|chunk| self.encode_without_post_process(chunk, false, !allow_special))
+                .collect::<Result<Vec<_>, _>>()?;
+            for mut chunk_ids in chunk_ids {
+                ids.append(&mut chunk_ids);
+            }
+        }
         Ok(self.post_process(ids, add_special_tokens))
     }
 
@@ -578,7 +668,17 @@ impl Tokenizer {
         input: &str,
         split_special_tokens: bool,
     ) -> PreTokenizedString {
+        self.build_pre_tokenized_with_added_token_options(input, split_special_tokens, false)
+    }
+
+    fn build_pre_tokenized_with_added_token_options(
+        &self,
+        input: &str,
+        split_special_tokens: bool,
+        bypass_added_tokens: bool,
+    ) -> PreTokenizedString {
         let segments = match &self.added_tokens {
+            Some(_) if bypass_added_tokens => vec![Segment::Text(input)],
             Some(at) if split_special_tokens => at.split_special_as_text(input),
             Some(at) => at.split(input),
             None => vec![Segment::Text(input)],
@@ -675,6 +775,57 @@ impl StructuralTokenConfig {
 
     fn is_empty(&self) -> bool {
         self.structural_matcher.is_empty()
+    }
+}
+
+fn tiktoken_safe_chunks(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut outer_start = 0;
+    let mut outer_chars = 0;
+    for (idx, _) in text.char_indices() {
+        if outer_chars == TIKTOKEN_MAX_ENCODE_CHARS {
+            push_whitespace_limited_chunks(&text[outer_start..idx], &mut chunks);
+            outer_start = idx;
+            outer_chars = 0;
+        }
+        outer_chars += 1;
+    }
+    push_whitespace_limited_chunks(&text[outer_start..], &mut chunks);
+    chunks
+}
+
+fn push_whitespace_limited_chunks<'a>(text: &'a str, chunks: &mut Vec<&'a str>) {
+    if text.is_empty() {
+        return;
+    }
+
+    let mut slice_start = 0;
+    let mut current_slice_len = 0;
+    let mut current_slice_is_space = text.chars().next().is_some_and(char::is_whitespace);
+
+    for (idx, char) in text.char_indices() {
+        let is_now_space = char.is_whitespace();
+        if current_slice_is_space ^ is_now_space {
+            current_slice_len = 1;
+            current_slice_is_space = is_now_space;
+        } else {
+            current_slice_len += 1;
+            if current_slice_len > TIKTOKEN_MAX_CONSECUTIVE_WHITESPACE_OR_NONWHITESPACE_CHARS {
+                if slice_start < idx {
+                    chunks.push(&text[slice_start..idx]);
+                }
+                slice_start = idx;
+                current_slice_len = 1;
+            }
+        }
+    }
+
+    if slice_start < text.len() {
+        chunks.push(&text[slice_start..]);
     }
 }
 
@@ -1519,6 +1670,56 @@ mod tests {
                 0, 102, // structural " <tool>"
                 0, 1, 10, 9, 9, 7, 2, // literal " <tool>"
             ]
+        );
+    }
+
+    #[test]
+    fn encode_segments_bypasses_added_tokens_for_text_segments() {
+        let tok = structural_test_tokenizer();
+
+        let ids = tok
+            .encode_segments(
+                [
+                    ("<tool>", true),
+                    (" hello <tool>", false),
+                    (" <think>", true),
+                    (" <think>", false),
+                ],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ids,
+            vec![
+                102, // structural non-special "<tool>"
+                0, 4, 3, 7, 7, 9, 0, 1, 10, 9, 9, 7, 2, // literal " hello <tool>"
+                0, 101, // structural " <think>"
+                0, 1, 10, 4, 5, 8, 6, 2, // literal " <think>"
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_segments_tiktoken_safe_splits_long_runs_like_legacy_tiktoken() {
+        let tok = structural_test_tokenizer();
+        let long = format!(
+            "{}<tool>{}",
+            "h".repeat(TIKTOKEN_MAX_CONSECUTIVE_WHITESPACE_OR_NONWHITESPACE_CHARS + 3),
+            "e".repeat(4),
+        );
+
+        let ids = tok
+            .encode_segments_tiktoken_safe([(long.as_str(), false)], false)
+            .unwrap();
+
+        assert_eq!(
+            ids.len(),
+            TIKTOKEN_MAX_CONSECUTIVE_WHITESPACE_OR_NONWHITESPACE_CHARS + 3 + "<tool>".len() + 4
+        );
+        assert!(
+            !ids.contains(&102),
+            "literal <tool> must not become added token"
         );
     }
 

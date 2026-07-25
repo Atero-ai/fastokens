@@ -93,7 +93,9 @@ def _get_rank_pair_for_sorting(split: tuple[int, int, bytes, bytes]) -> tuple[in
     return left_rank, right_rank
 
 
-def _extract_vocab_and_merges(mergeable_ranks: dict[bytes, int]) -> tuple[dict[str, int], list[list[str]]]:
+def _extract_vocab_and_merges(
+    mergeable_ranks: dict[bytes, int],
+) -> tuple[dict[str, int], list[list[str]]]:
     vocab = {
         _token_bytes_to_string(token): rank
         for token, rank in sorted(mergeable_ranks.items(), key=lambda item: item[1])
@@ -108,7 +110,9 @@ def _extract_vocab_and_merges(mergeable_ranks: dict[bytes, int]) -> tuple[dict[s
             left = token[:index]
             right = token[index:]
             if left in mergeable_ranks and right in mergeable_ranks:
-                split_candidates.append((mergeable_ranks[left], mergeable_ranks[right], left, right))
+                split_candidates.append(
+                    (mergeable_ranks[left], mergeable_ranks[right], left, right)
+                )
         split_candidates.sort(key=_get_rank_pair_for_sorting)
         merge_candidates.extend(
             _MergeCandidate(
@@ -123,18 +127,25 @@ def _extract_vocab_and_merges(mergeable_ranks: dict[bytes, int]) -> tuple[dict[s
 
     merge_candidates.sort(key=lambda item: (item.rank, item.left_rank, item.right_rank))
     merges = [
-        [_token_bytes_to_string(candidate.left), _token_bytes_to_string(candidate.right)]
+        [
+            _token_bytes_to_string(candidate.left),
+            _token_bytes_to_string(candidate.right),
+        ]
         for candidate in merge_candidates
     ]
     return vocab, merges
 
 
-def _normalise_special_tokens(special_tokens: Mapping[str, int] | None) -> list[_AddedToken]:
+def _normalise_special_tokens(
+    special_tokens: Mapping[str, int] | None,
+) -> list[_AddedToken]:
     if special_tokens is None:
         return []
     return [
         _AddedToken(id=token_id, content=token, special=True)
-        for token, token_id in sorted(dict(special_tokens).items(), key=lambda item: item[1])
+        for token, token_id in sorted(
+            dict(special_tokens).items(), key=lambda item: item[1]
+        )
     ]
 
 
@@ -153,7 +164,10 @@ def _auto_tokenizer_entries(auto_tokenizer: Any) -> list[str]:
 def _is_kimi_tiktoken_config(config: dict[str, Any]) -> bool:
     auto_map = config.get("auto_map", {})
     if isinstance(auto_map, dict):
-        if any("tokenization_kimi.TikTokenTokenizer" in item for item in _auto_tokenizer_entries(auto_map.get("AutoTokenizer"))):
+        if any(
+            "tokenization_kimi.TikTokenTokenizer" in item
+            for item in _auto_tokenizer_entries(auto_map.get("AutoTokenizer"))
+        ):
             return True
     if config.get("tokenizer_class") != "TikTokenTokenizer":
         return False
@@ -161,13 +175,20 @@ def _is_kimi_tiktoken_config(config: dict[str, Any]) -> bool:
     if not isinstance(added_tokens_decoder, dict):
         return False
     kimi_markers = {
+        "<|open|>",
+        "<|close|>",
+        "<|sep|>",
+        "<|end_of_msg|>",
         "<|im_user|>",
         "<|im_assistant|>",
         "<|im_middle|>",
         "<|tool_calls_section_begin|>",
     }
     for token_config in added_tokens_decoder.values():
-        if isinstance(token_config, dict) and token_config.get("content") in kimi_markers:
+        if (
+            isinstance(token_config, dict)
+            and token_config.get("content") in kimi_markers
+        ):
             return True
     return False
 
@@ -176,7 +197,9 @@ def _has_tokenizer_identity(config: dict[str, Any]) -> bool:
     return "tokenizer_class" in config or "auto_map" in config
 
 
-def _config_added_tokens(config: dict[str, Any], base_vocab_size: int) -> list[_AddedToken]:
+def _config_added_tokens(
+    config: dict[str, Any], base_vocab_size: int
+) -> list[_AddedToken]:
     added_tokens: dict[int, _AddedToken] = {}
     added_tokens_decoder = config.get("added_tokens_decoder", {})
     if isinstance(added_tokens_decoder, dict):
@@ -215,13 +238,22 @@ def _config_added_tokens(config: dict[str, Any], base_vocab_size: int) -> list[_
         for token_id in range(base_vocab_size, max_token_id + 1):
             added_tokens.setdefault(
                 token_id,
-                _AddedToken(id=token_id, content=f"<|reserved_token_{token_id}|>", special=True),
+                _AddedToken(
+                    id=token_id, content=f"<|reserved_token_{token_id}|>", special=True
+                ),
             )
     return [added_tokens[token_id] for token_id in sorted(added_tokens)]
 
 
 def _load_model_config(model: str | Path) -> tuple[str, dict[str, Any]]:
-    if isinstance(model, str) and urlparse(model).scheme in {"http", "https", "s3", "gs", "az", "file"}:
+    if isinstance(model, str) and urlparse(model).scheme in {
+        "http",
+        "https",
+        "s3",
+        "gs",
+        "az",
+        "file",
+    }:
         return model, {}
     model_path = Path(model)
     if model_path.is_dir():
@@ -348,7 +380,9 @@ def tiktoken_model_to_tokenizer_json(
         if special_tokens is None
         else _normalise_special_tokens(special_tokens)
     )
-    return _tokenizer_json_from_parts(mergeable_ranks, pattern, added_tokens, pretty=pretty)
+    return _tokenizer_json_from_parts(
+        mergeable_ranks, pattern, added_tokens, pretty=pretty
+    )
 
 
 def tiktoken_to_tokenizer_json(encoding: Any, *, pretty: bool = False) -> str | None:

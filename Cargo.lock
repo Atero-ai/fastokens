@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "fastokens-b10"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "fastokens-python"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "fastokens-b10",
  "numpy",

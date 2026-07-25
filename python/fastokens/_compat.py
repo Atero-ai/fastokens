@@ -30,6 +30,7 @@ def _reject_unsupported_kwargs(kwargs: dict) -> None:
 # _TokenizerShim
 # ---------------------------------------------------------------------------
 
+
 class _TokenizerShim:
     """
     Complete replacement for ``tokenizers.Tokenizer``.
@@ -80,7 +81,9 @@ class _TokenizerShim:
             if trunc is not None:
                 self._fast.enable_truncation(**trunc)
             if pad is not None:
-                self._fast.enable_padding(**{k: v for k, v in pad.items() if v is not None})
+                self._fast.enable_padding(
+                    **{k: v for k, v in pad.items() if v is not None}
+                )
             self.encode_special_tokens = enc_special
 
     def __deepcopy__(self, memo):
@@ -120,7 +123,10 @@ class _TokenizerShim:
         from huggingface_hub import hf_hub_download
 
         path = hf_hub_download(
-            identifier, "tokenizer.json", revision=revision, token=token,
+            identifier,
+            "tokenizer.json",
+            revision=revision,
+            token=token,
         )
         return cls.from_file(path)
 
@@ -173,7 +179,9 @@ class _TokenizerShim:
         if value is None:
             self._fast.no_padding()
         else:
-            self._fast.enable_padding(**{k: v for k, v in value.items() if v is not None})
+            self._fast.enable_padding(
+                **{k: v for k, v in value.items() if v is not None}
+            )
 
     def enable_truncation(
         self,
@@ -204,7 +212,11 @@ class _TokenizerShim:
             pad_type_id=pad_type_id,
             pad_token=pad_token,
             **({"length": length} if length is not None else {}),
-            **({"pad_to_multiple_of": pad_to_multiple_of} if pad_to_multiple_of is not None else {}),
+            **(
+                {"pad_to_multiple_of": pad_to_multiple_of}
+                if pad_to_multiple_of is not None
+                else {}
+            ),
         )
 
     def no_padding(self) -> None:
@@ -225,7 +237,9 @@ class _TokenizerShim:
         if pair is not None:
             raise NotImplementedError("pair encoding is not supported by fastokens")
         if is_pretokenized:
-            raise NotImplementedError("pre-tokenized input is not supported by fastokens")
+            raise NotImplementedError(
+                "pre-tokenized input is not supported by fastokens"
+            )
         if split_special_tokens is None:
             split_special_tokens = self._encode_special_tokens
         return self._fast.encode(
@@ -289,6 +303,24 @@ class _TokenizerShim:
             add_special_tokens=add_special_tokens,
         )
 
+    def encode_segments(
+        self,
+        segments: list[tuple[str, bool]],
+        add_special_tokens: bool = False,
+        tiktoken_safe: bool = True,
+    ) -> Encoding:
+        """Encode ``(text, allow_special)`` segments in one backend call.
+
+        ``tiktoken_safe=True`` is the default and reproduces legacy tiktoken
+        tokenizer chunking for token-ID parity. Pass ``False`` only when you
+        explicitly want whole-segment BPE encoding.
+        """
+        return self._fast.encode_segments(
+            segments,
+            add_special_tokens=add_special_tokens,
+            tiktoken_safe=tiktoken_safe,
+        )
+
     async def async_encode_batch(
         self,
         inputs: list[str],
@@ -331,7 +363,9 @@ class _TokenizerShim:
         sequences: list[list[int]],
         skip_special_tokens: bool = True,
     ) -> list[str]:
-        return self._fast.decode_batch(sequences, skip_special_tokens=skip_special_tokens)
+        return self._fast.decode_batch(
+            sequences, skip_special_tokens=skip_special_tokens
+        )
 
     async def async_decode_batch(
         self,
@@ -431,11 +465,10 @@ class _TokenizerShim:
         self._fast.post_processor = value
 
 
-
-
 # ---------------------------------------------------------------------------
 # Helper classes
 # ---------------------------------------------------------------------------
+
 
 class _DecoderShim:
     """

@@ -1,5 +1,8 @@
 from fastokens._native import StructuralTokenConfig, Tokenizer
-from fastokens.tiktoken import tiktoken_model_to_tokenizer_json, tiktoken_to_tokenizer_json
+from fastokens.tiktoken import (
+    tiktoken_model_to_tokenizer_json,
+    tiktoken_to_tokenizer_json,
+)
 
 __all__ = [
     "StructuralTokenConfig",
@@ -108,10 +111,13 @@ def patch_transformers() -> None:
     _patched = True
 
     from importlib.metadata import version
+
     # Assuming transformers is installed.
     # If not, this will raise an error, which is fine since patching won't work without it.
     transformers_version = version("transformers")
-    print(f"[fastokens] patch_transformers: successfully patched transformers v{transformers_version}")
+    print(
+        f"[fastokens] patch_transformers: successfully patched transformers v{transformers_version}"
+    )
 
 
 def unpatch_transformers() -> None:

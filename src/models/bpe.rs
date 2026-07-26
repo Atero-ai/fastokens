@@ -5,7 +5,7 @@ use std::{
     fmt,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -597,6 +597,8 @@ impl MergeAdjacency {
 pub struct Bpe {
     #[serde(skip)]
     id: usize,
+    #[serde(skip)]
+    content_affinity_available: AtomicBool,
     daac: DoubleArrayAhoCorasick<TokenId>,
     merge_map: MergeMap,
     unmerge_map: Vec<(TokenId, TokenId)>,
@@ -811,6 +813,7 @@ impl Bpe {
 
         Ok(Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            content_affinity_available: AtomicBool::new(true),
             daac,
             merge_map: flat_merge_map,
             unmerge_map,
@@ -1316,6 +1319,26 @@ impl Bpe {
         splits: &[crate::pre_tokenized::Split],
         out: &mut Vec<u32>,
     ) -> Result<()> {
+        self.tokenize_batch_fused_impl::<false>(buffer, splits, out, &mut Vec::new())
+    }
+
+    pub fn tokenize_batch_fused_indexed(
+        &self,
+        buffer: &str,
+        splits: &[crate::pre_tokenized::Split],
+        out: &mut Vec<u32>,
+        ends: &mut Vec<usize>,
+    ) -> Result<()> {
+        self.tokenize_batch_fused_impl::<true>(buffer, splits, out, ends)
+    }
+
+    fn tokenize_batch_fused_impl<const RECORD_ENDS: bool>(
+        &self,
+        buffer: &str,
+        splits: &[crate::pre_tokenized::Split],
+        out: &mut Vec<u32>,
+        ends: &mut Vec<usize>,
+    ) -> Result<()> {
         let bpe_id = self.id;
         TL_FUSED_CACHE.with(|c| {
             let mut cache = c.borrow_mut();
@@ -1330,16 +1353,25 @@ impl Bpe {
                 } else if !split.range.is_empty() {
                     let text = &buffer[split.range.clone()];
                     if text.is_empty() {
+                        if RECORD_ENDS {
+                            ends.push(out.len());
+                        }
                         continue;
                     }
 
                     if cache.get(text, out) {
+                        if RECORD_ENDS {
+                            ends.push(out.len());
+                        }
                         continue;
                     }
 
                     let start = out.len();
                     if self.fused_shared_cache.get_into(text, out) {
                         cache.insert(text, &out[start..]);
+                        if RECORD_ENDS {
+                            ends.push(out.len());
+                        }
                         continue;
                     }
 
@@ -1348,6 +1380,9 @@ impl Bpe {
                     {
                         out.push(id);
                         cache.insert(text, &out[start..]);
+                        if RECORD_ENDS {
+                            ends.push(out.len());
+                        }
                         continue;
                     }
 
@@ -1355,6 +1390,9 @@ impl Bpe {
 
                     cache.insert(text, &out[start..]);
                     self.fused_shared_cache.insert(text, &out[start..]);
+                }
+                if RECORD_ENDS {
+                    ends.push(out.len());
                 }
             }
             Ok(())
@@ -1372,12 +1410,18 @@ impl Bpe {
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
     }
+
+    pub(crate) fn take_content_affinity(&self) -> bool {
+        self.content_affinity_available
+            .swap(false, Ordering::Relaxed)
+    }
 }
 
 impl Clone for Bpe {
     fn clone(&self) -> Self {
         Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            content_affinity_available: AtomicBool::new(true),
             daac: self.daac.clone(),
             merge_map: self.merge_map.clone(),
             unmerge_map: self.unmerge_map.clone(),
@@ -1481,6 +1525,13 @@ mod tests {
     fn repeated_merge() {
         let bpe = test_bpe();
         assert_eq!(bpe.tokenize("abab").unwrap(), vec![4, 4]);
+    }
+
+    #[test]
+    fn content_affinity_is_available_once_per_bpe() {
+        let bpe = test_bpe();
+        assert!(bpe.take_content_affinity());
+        assert!(!bpe.take_content_affinity());
     }
 
     #[test]

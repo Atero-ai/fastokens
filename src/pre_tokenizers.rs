@@ -42,6 +42,10 @@ pub enum PreTokenizer {
 }
 
 impl PreTokenizer {
+    pub(crate) fn prefers_content_affine_bpe(&self) -> bool {
+        matches!(self, Self::Split(split) if split.prefers_content_affine_bpe())
+    }
+
     /// Build a pre-tokenizer from its JSON configuration.
     pub fn from_config(config: PreTokenizerConfig) -> Result<Self, Error> {
         match config {

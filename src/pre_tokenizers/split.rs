@@ -227,6 +227,13 @@ impl TryFrom<SplitRaw> for Split {
 }
 
 impl Split {
+    pub(crate) fn prefers_content_affine_bpe(&self) -> bool {
+        matches!(
+            self.fast_scheme,
+            Some(FastSplitScheme::Kimi | FastSplitScheme::O200k)
+        )
+    }
+
     /// Build a [`Split`] from raw JSON fields.
     ///
     /// `pattern` must be a JSON object with either a `"String"` key (literal,
@@ -973,6 +980,23 @@ mod tests {
     use super::*;
 
     // ── Fast-scheme scanner integration ─────────────────
+
+    #[test]
+    fn content_affinity_is_limited_to_o200k_families() {
+        use crate::pre_tokenizers::{
+            fast_split::{QWEN2_N3_PATTERN, QWEN2_PATTERN},
+            fast_split_o200k::{KIMI_PATTERN, O200K_PATTERN},
+        };
+
+        for pattern in [KIMI_PATTERN, O200K_PATTERN] {
+            let split = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            assert!(split.prefers_content_affine_bpe());
+        }
+        for pattern in [QWEN2_PATTERN, QWEN2_N3_PATTERN, r"\w+"] {
+            let split = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            assert!(!split.prefers_content_affine_bpe());
+        }
+    }
 
     /// The specialized scanner (sequential and parallel chunked) must produce
     /// exactly the splits of the generic regex engines for its pattern.

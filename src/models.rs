@@ -66,6 +66,25 @@ impl Model {
         }
     }
 
+    #[inline(always)]
+    pub fn tokenize_batch_fused_indexed(
+        &self,
+        buffer: &str,
+        splits: &[crate::pre_tokenized::Split],
+        out: &mut Vec<u32>,
+        ends: &mut Vec<usize>,
+    ) -> Result<()> {
+        match self {
+            Self::Bpe(bpe) => bpe.tokenize_batch_fused_indexed(buffer, splits, out, ends),
+        }
+    }
+
+    pub(crate) fn take_content_affinity(&self) -> bool {
+        match self {
+            Self::Bpe(bpe) => bpe.take_content_affinity(),
+        }
+    }
+
     /// Look up the string representation of a token ID.
     pub fn id_to_token(&self, id: u32) -> Option<&str> {
         match self {

@@ -328,9 +328,15 @@ impl Tokenizer {
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
             split.pre_tokenize(&mut pts)?;
+            let content_affine = split.prefers_content_affine_bpe()
+                && pts.buffer().len() >= 64 * 1024
+                && self.model.take_content_affinity();
             return pts
-                .tokenize_batched(|buf, splits, out| {
-                    self.model.tokenize_batch_fused(buf, splits, out)
+                .tokenize_batched(content_affine, |buf, splits, out, ends| match ends {
+                    Some(ends) => self
+                        .model
+                        .tokenize_batch_fused_indexed(buf, splits, out, ends),
+                    None => self.model.tokenize_batch_fused(buf, splits, out),
                 })
                 .map_err(Error::Model);
         }

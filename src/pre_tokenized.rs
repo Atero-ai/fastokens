@@ -6,6 +6,32 @@ use rayon::prelude::*;
 /// this threshold the rayon overhead exceeds the parallelism gain.
 const PARALLEL_THRESHOLD: usize = 16;
 
+#[inline]
+fn content_hash(bytes: &[u8]) -> u64 {
+    let mut state = bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        state = state
+            .wrapping_add(u64::from_ne_bytes(chunk.try_into().unwrap()))
+            .wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    for &byte in chunks.remainder() {
+        state = state
+            .wrapping_add(byte as u64)
+            .wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    state
+}
+
+#[inline]
+fn split_bucket(buffer: &str, split: &Split, buckets: usize) -> usize {
+    let hash = match split.token_id {
+        Some(id) => (id as u64).wrapping_mul(0x517c_c1b7_2722_0a95),
+        None => content_hash(&buffer.as_bytes()[split.range.clone()]),
+    };
+    hash as usize % buckets
+}
+
 /// Dedicated rayon thread pool for BPE tokenization.
 /// Using a fixed-size pool ensures the same threads are reused across calls,
 /// keeping their thread-local caches warm. Capped at 8 threads to stay within
@@ -149,38 +175,85 @@ impl PreTokenizedString {
         })
     }
 
-    /// Batched tokenization: the callback receives the full buffer and a chunk
-    /// of splits, allowing it to amortize per-call overhead (e.g. thread-local
-    /// cache access) across the entire chunk.
-    pub fn tokenize_batched<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    /// Batched tokenization grouped by pretoken content. Equal text is assigned
+    /// to one worker, avoiding duplicate cold work in per-thread caches. The
+    /// callback records the cumulative output length after every split so the
+    /// original order can be restored after parallel processing.
+    pub fn tokenize_batched<F>(
+        &self,
+        content_affine: bool,
+        tokenize_fn: F,
+    ) -> Result<Vec<u32>, String>
     where
-        F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
+        F: Fn(&str, &[Split], &mut Vec<u32>, Option<&mut Vec<usize>>) -> Result<(), String> + Sync,
     {
         if self.splits.len() < PARALLEL_THRESHOLD {
             let mut ids = Vec::with_capacity(self.splits.len() * 2);
-            tokenize_fn(&self.buffer, &self.splits, &mut ids)?;
+            tokenize_fn(&self.buffer, &self.splits, &mut ids, None)?;
             return Ok(ids);
         }
 
         let pool = bpe_pool();
-        let chunk_size = self.splits.len().div_ceil(pool.current_num_threads());
+        if !content_affine {
+            let chunk_size = self.splits.len().div_ceil(pool.current_num_threads());
+            return pool.install(|| {
+                let chunk_results: Result<Vec<Vec<u32>>, String> = self
+                    .splits
+                    .par_chunks(chunk_size)
+                    .map(|chunk| {
+                        let mut ids = Vec::with_capacity(chunk.len() * 3);
+                        tokenize_fn(&self.buffer, chunk, &mut ids, None)?;
+                        Ok(ids)
+                    })
+                    .collect();
 
+                let chunks = chunk_results?;
+                let total: usize = chunks.iter().map(Vec::len).sum();
+                let mut ids = Vec::with_capacity(total);
+                for chunk_ids in chunks {
+                    ids.extend(chunk_ids);
+                }
+                Ok(ids)
+            });
+        }
+
+        let worker_count = pool.current_num_threads().min(self.splits.len());
+        let bucket_capacity = self.splits.len().div_ceil(worker_count);
+        let mut buckets: Vec<Vec<Split>> = (0..worker_count)
+            .map(|_| Vec::with_capacity(bucket_capacity))
+            .collect();
+        let mut assignments = Vec::with_capacity(self.splits.len());
+        for split in &self.splits {
+            let bucket = split_bucket(&self.buffer, split, worker_count);
+            assignments.push(bucket as u8);
+            buckets[bucket].push(split.clone());
+        }
         pool.install(|| {
-            let chunk_results: Result<Vec<Vec<u32>>, String> = self
-                .splits
-                .par_chunks(chunk_size)
-                .map(|chunk| {
-                    let mut ids = Vec::with_capacity(chunk.len() * 3);
-                    tokenize_fn(&self.buffer, chunk, &mut ids)?;
-                    Ok(ids)
+            let bucket_results: Result<Vec<(Vec<u32>, Vec<usize>)>, String> = buckets
+                .into_par_iter()
+                .map(|bucket| {
+                    let mut ids = Vec::with_capacity(bucket.len() * 3);
+                    let mut ends = Vec::with_capacity(bucket.len());
+                    tokenize_fn(&self.buffer, &bucket, &mut ids, Some(&mut ends))?;
+                    if ends.len() != bucket.len() {
+                        return Err("batched tokenizer did not record every split".to_string());
+                    }
+                    Ok((ids, ends))
                 })
                 .collect();
 
-            let chunks = chunk_results?;
-            let total: usize = chunks.iter().map(Vec::len).sum();
+            let buckets = bucket_results?;
+            let total: usize = buckets.iter().map(|(ids, _)| ids.len()).sum();
             let mut ids = Vec::with_capacity(total);
-            for chunk_ids in chunks {
-                ids.extend(chunk_ids);
+            let mut positions = vec![0usize; worker_count];
+            for bucket in assignments {
+                let bucket = bucket as usize;
+                let position = positions[bucket];
+                let (bucket_ids, ends) = &buckets[bucket];
+                let start = position.checked_sub(1).map_or(0, |previous| ends[previous]);
+                let end = ends[position];
+                ids.extend_from_slice(&bucket_ids[start..end]);
+                positions[bucket] += 1;
             }
             Ok(ids)
         })
@@ -346,5 +419,40 @@ mod tests {
         let pts = PreTokenizedString::from_text("x");
         let err = pts.tokenize(|_, _out| Err("boom".to_string())).unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn tokenize_batched_restores_content_bucket_order() {
+        let pieces = ["same", "x", "same", "longer", "x", "same"]
+            .into_iter()
+            .cycle()
+            .take(PARALLEL_THRESHOLD * 2)
+            .collect::<Vec<_>>();
+        let mut buffer = String::new();
+        let mut splits = Vec::new();
+        for piece in &pieces {
+            let start = buffer.len();
+            buffer.push_str(piece);
+            splits.push(Split {
+                range: start..buffer.len(),
+                token_id: None,
+            });
+        }
+        let pts = PreTokenizedString::new(buffer, splits);
+        let ids = pts
+            .tokenize_batched(true, |buffer, splits, out, ends| {
+                let ends = ends.unwrap();
+                for split in splits {
+                    out.push(buffer[split.range.clone()].len() as u32);
+                    ends.push(out.len());
+                }
+                Ok(())
+            })
+            .unwrap();
+        let expected = pieces
+            .iter()
+            .map(|piece| piece.len() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected);
     }
 }

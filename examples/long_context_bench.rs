@@ -62,10 +62,13 @@ fn main() {
         let actual_tokens = calibration.encode(&text).expect("count tokens").len();
         let mib = text.len() as f64 / (1 << 20) as f64;
         let mut times = Vec::with_capacity(rounds);
+        let mut construction_times = Vec::with_capacity(rounds);
 
         for _ in 0..rounds {
+            let construction_start = Instant::now();
             let tokenizer =
                 fastokens::Tokenizer::from_json(json.clone()).expect("construct tokenizer");
+            construction_times.push(construction_start.elapsed().as_secs_f64() * 1e3);
             let start = Instant::now();
             let ids = tokenizer.encode(&text).expect("encode context");
             times.push(start.elapsed().as_secs_f64() * 1e3);
@@ -73,11 +76,14 @@ fn main() {
         }
 
         times.sort_by(f64::total_cmp);
+        construction_times.sort_by(f64::total_cmp);
         let median = percentile(&times, 50);
         let p90 = percentile(&times, 90);
+        let construction_median = percentile(&construction_times, 50);
         println!(
             "{target:>9} target | {actual_tokens:>9} actual | {mib:>6.2} MiB | \
-             p50 {median:>8.2} ms | p90 {p90:>8.2} ms | {throughput:>6.1} MiB/s",
+             p50 {median:>8.2} ms | p90 {p90:>8.2} ms | {throughput:>6.1} MiB/s | \
+             load {construction_median:>7.1} ms",
             throughput = mib / (median / 1e3),
         );
     }

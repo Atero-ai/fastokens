@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "fastokens-b10"
 dynamic = ["version"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["numpy>=1.23.0"]
 
 [project.optional-dependencies]

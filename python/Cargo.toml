@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 fastokens = { package = "fastokens-b10", path = ".." }
 numpy = "0.25"
-pyo3 = {version = "0.25", features = ["extension-module", "abi3-py39"] }
+pyo3 = {version = "0.25", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
 pythonize = "0.25"
 rayon = "1"

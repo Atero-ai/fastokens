@@ -373,72 +373,132 @@ fn truncate_for_error(value: &str, max_chars: usize) -> String {
 /// raise `NotImplementedError` to match the HuggingFace API surface.
 #[pyclass(name = "Encoding")]
 pub struct PyEncoding {
-    #[pyo3(get, set)]
     pub ids: Vec<u32>,
-    #[pyo3(get, set)]
-    pub attention_mask: Vec<u32>,
-    #[pyo3(get, set)]
-    pub type_ids: Vec<u32>,
-    #[pyo3(get, set)]
-    pub special_tokens_mask: Vec<u32>,
+    attention_mask: Option<Vec<u32>>,
+    type_ids: Option<Vec<u32>>,
+    special_tokens_mask: Option<Vec<u32>>,
     #[pyo3(get, set)]
     pub n_sequences: usize,
     // Backing storage for set-only properties.
-    _sequence_ids: Vec<Option<i64>>,
-    _word_ids: Vec<Option<i64>>,
+    _sequence_ids: Option<Vec<Option<i64>>>,
+    _word_ids: Option<Vec<Option<i64>>>,
 }
 
 impl PyEncoding {
-    pub fn make(ids: Vec<u32>, attention_mask: Vec<u32>) -> Self {
-        let n = ids.len();
+    pub fn make(ids: Vec<u32>) -> Self {
         Self {
-            type_ids: vec![0u32; n],
-            special_tokens_mask: vec![0u32; n],
+            attention_mask: None,
+            type_ids: None,
+            special_tokens_mask: None,
             n_sequences: 1,
-            _sequence_ids: vec![Some(0); n],
-            _word_ids: vec![None; n],
+            _sequence_ids: None,
+            _word_ids: None,
             ids,
-            attention_mask,
         }
+    }
+
+    fn materialized_attention_mask(&self) -> Vec<u32> {
+        self.attention_mask
+            .clone()
+            .unwrap_or_else(|| vec![1u32; self.ids.len()])
+    }
+
+    fn materialized_type_ids(&self) -> Vec<u32> {
+        self.type_ids
+            .clone()
+            .unwrap_or_else(|| vec![0u32; self.ids.len()])
+    }
+
+    fn materialized_special_tokens_mask(&self) -> Vec<u32> {
+        self.special_tokens_mask
+            .clone()
+            .unwrap_or_else(|| vec![0u32; self.ids.len()])
+    }
+
+    fn materialized_sequence_ids(&self) -> Vec<Option<i64>> {
+        self._sequence_ids
+            .clone()
+            .unwrap_or_else(|| vec![Some(0); self.ids.len()])
+    }
+
+    fn materialized_word_ids(&self) -> Vec<Option<i64>> {
+        self._word_ids
+            .clone()
+            .unwrap_or_else(|| vec![None; self.ids.len()])
     }
 
     fn apply_slice(&mut self, start: usize, end: usize) {
         self.ids = self.ids[start..end].to_vec();
-        self.attention_mask = self.attention_mask[start..end].to_vec();
-        self.type_ids = self.type_ids[start..end].to_vec();
-        self.special_tokens_mask = self.special_tokens_mask[start..end].to_vec();
-        self._sequence_ids = self._sequence_ids[start..end].to_vec();
-        self._word_ids = self._word_ids[start..end].to_vec();
+        if let Some(values) = &self.attention_mask {
+            self.attention_mask = Some(values[start..end].to_vec());
+        }
+        if let Some(values) = &self.type_ids {
+            self.type_ids = Some(values[start..end].to_vec());
+        }
+        if let Some(values) = &self.special_tokens_mask {
+            self.special_tokens_mask = Some(values[start..end].to_vec());
+        }
+        if let Some(values) = &self._sequence_ids {
+            self._sequence_ids = Some(values[start..end].to_vec());
+        }
+        if let Some(values) = &self._word_ids {
+            self._word_ids = Some(values[start..end].to_vec());
+        }
     }
 
     fn extend_right(&mut self, pad_id: u32, pad_type_id: u32, count: usize) {
+        let n = self.ids.len();
+        let target = n + count;
         self.ids.extend(vec![pad_id; count]);
-        self.attention_mask.extend(vec![0u32; count]);
-        self.type_ids.extend(vec![pad_type_id; count]);
-        self.special_tokens_mask.extend(vec![0u32; count]);
-        self._sequence_ids.extend(vec![None; count]);
-        self._word_ids.extend(vec![None; count]);
+        let mut attention_mask = self.attention_mask.take().unwrap_or_else(|| vec![1u32; n]);
+        attention_mask.resize(target, 0u32);
+        self.attention_mask = Some(attention_mask);
+
+        let mut type_ids = self.type_ids.take().unwrap_or_else(|| vec![0u32; n]);
+        type_ids.resize(target, pad_type_id);
+        self.type_ids = Some(type_ids);
+
+        if let Some(mut special_tokens_mask) = self.special_tokens_mask.take() {
+            special_tokens_mask.resize(target, 0u32);
+            self.special_tokens_mask = Some(special_tokens_mask);
+        }
+        if let Some(mut sequence_ids) = self._sequence_ids.take() {
+            sequence_ids.resize(target, None);
+            self._sequence_ids = Some(sequence_ids);
+        }
+        if let Some(mut word_ids) = self._word_ids.take() {
+            word_ids.resize(target, None);
+            self._word_ids = Some(word_ids);
+        }
     }
 
     fn extend_left(&mut self, pad_id: u32, pad_type_id: u32, count: usize) {
+        let n = self.ids.len();
         let mut ids = vec![pad_id; count];
         ids.extend_from_slice(&self.ids);
         let mut mask = vec![0u32; count];
-        mask.extend_from_slice(&self.attention_mask);
+        mask.extend_from_slice(&self.attention_mask.take().unwrap_or_else(|| vec![1u32; n]));
         let mut type_ids = vec![pad_type_id; count];
-        type_ids.extend_from_slice(&self.type_ids);
-        let mut special = vec![0u32; count];
-        special.extend_from_slice(&self.special_tokens_mask);
-        let mut seq_ids = vec![None; count];
-        seq_ids.extend_from_slice(&self._sequence_ids);
-        let mut word_ids = vec![None; count];
-        word_ids.extend_from_slice(&self._word_ids);
+        type_ids.extend_from_slice(&self.type_ids.take().unwrap_or_else(|| vec![0u32; n]));
         self.ids = ids;
-        self.attention_mask = mask;
-        self.type_ids = type_ids;
-        self.special_tokens_mask = special;
-        self._sequence_ids = seq_ids;
-        self._word_ids = word_ids;
+        self.attention_mask = Some(mask);
+        self.type_ids = Some(type_ids);
+
+        if let Some(special_tokens_mask) = self.special_tokens_mask.take() {
+            let mut special = vec![0u32; count];
+            special.extend_from_slice(&special_tokens_mask);
+            self.special_tokens_mask = Some(special);
+        }
+        if let Some(sequence_ids) = self._sequence_ids.take() {
+            let mut seq_ids = vec![None; count];
+            seq_ids.extend_from_slice(&sequence_ids);
+            self._sequence_ids = Some(seq_ids);
+        }
+        if let Some(word_ids) = self._word_ids.take() {
+            let mut word_ids_padded = vec![None; count];
+            word_ids_padded.extend_from_slice(&word_ids);
+            self._word_ids = Some(word_ids_padded);
+        }
     }
 }
 
@@ -447,9 +507,45 @@ impl PyEncoding {
     #[new]
     #[pyo3(signature = (ids, attention_mask = None))]
     fn new(ids: Vec<u32>, attention_mask: Option<Vec<u32>>) -> Self {
-        let n = ids.len();
-        let mask = attention_mask.unwrap_or_else(|| vec![1u32; n]);
-        Self::make(ids, mask)
+        let mut encoding = Self::make(ids);
+        encoding.attention_mask = attention_mask;
+        encoding
+    }
+
+    #[getter]
+    fn ids(&self) -> Vec<u32> {
+        self.ids.clone()
+    }
+    #[setter]
+    fn set_ids(&mut self, value: Vec<u32>) {
+        self.ids = value;
+    }
+
+    #[getter]
+    fn attention_mask(&self) -> Vec<u32> {
+        self.materialized_attention_mask()
+    }
+    #[setter]
+    fn set_attention_mask(&mut self, value: Vec<u32>) {
+        self.attention_mask = Some(value);
+    }
+
+    #[getter]
+    fn type_ids(&self) -> Vec<u32> {
+        self.materialized_type_ids()
+    }
+    #[setter]
+    fn set_type_ids(&mut self, value: Vec<u32>) {
+        self.type_ids = Some(value);
+    }
+
+    #[getter]
+    fn special_tokens_mask(&self) -> Vec<u32> {
+        self.materialized_special_tokens_mask()
+    }
+    #[setter]
+    fn set_special_tokens_mask(&mut self, value: Vec<u32>) {
+        self.special_tokens_mask = Some(value);
     }
 
     fn __len__(&self) -> usize {
@@ -462,7 +558,7 @@ impl PyEncoding {
 
     /// Move selected fields into NumPy uint32 arrays.
     ///
-    /// This consumes/drains the encoding's per-token fields. The returned dict
+    /// This drains the encoding's per-token fields. The returned dict
     /// contains only requested arrays; unrequested fields are cleared.
     #[pyo3(signature = (
         ids = true,
@@ -485,24 +581,28 @@ impl PyEncoding {
         }
 
         let out = PyDict::new(py);
+        let n = self.ids.len();
         let ids_vec = std::mem::take(&mut self.ids);
-        let attention_mask_vec = std::mem::take(&mut self.attention_mask);
-        let type_ids_vec = std::mem::take(&mut self.type_ids);
-        let special_tokens_mask_vec = std::mem::take(&mut self.special_tokens_mask);
-        std::mem::take(&mut self._sequence_ids);
-        std::mem::take(&mut self._word_ids);
+        let attention_mask_vec = self.attention_mask.take();
+        let type_ids_vec = self.type_ids.take();
+        let special_tokens_mask_vec = self.special_tokens_mask.take();
+        self._sequence_ids = None;
+        self._word_ids = None;
         self.n_sequences = 0;
 
         if ids {
             out.set_item("ids", ids_vec.into_pyarray(py))?;
         }
         if attention_mask {
+            let attention_mask_vec = attention_mask_vec.unwrap_or_else(|| vec![1u32; n]);
             out.set_item("attention_mask", attention_mask_vec.into_pyarray(py))?;
         }
         if type_ids {
+            let type_ids_vec = type_ids_vec.unwrap_or_else(|| vec![0u32; n]);
             out.set_item("type_ids", type_ids_vec.into_pyarray(py))?;
         }
         if special_tokens_mask {
+            let special_tokens_mask_vec = special_tokens_mask_vec.unwrap_or_else(|| vec![0u32; n]);
             out.set_item(
                 "special_tokens_mask",
                 special_tokens_mask_vec.into_pyarray(py),
@@ -541,7 +641,7 @@ impl PyEncoding {
     }
     #[setter]
     fn set_sequence_ids(&mut self, value: Vec<Option<i64>>) {
-        self._sequence_ids = value;
+        self._sequence_ids = Some(value);
     }
 
     #[getter]
@@ -552,7 +652,7 @@ impl PyEncoding {
     }
     #[setter]
     fn set_word_ids(&mut self, value: Vec<Option<i64>>) {
-        self._word_ids = value;
+        self._word_ids = Some(value);
     }
 
     #[getter]
@@ -563,7 +663,7 @@ impl PyEncoding {
     }
     #[setter]
     fn set_words(&mut self, value: Vec<Option<i64>>) {
-        self._word_ids = value;
+        self._word_ids = Some(value);
     }
 
     /// Always empty — fastokens does not produce overflowing sequences.
@@ -578,7 +678,7 @@ impl PyEncoding {
 
     fn set_sequence_id(&mut self, sequence_id: i64) {
         let n = self.ids.len();
-        self._sequence_ids = vec![Some(sequence_id); n];
+        self._sequence_ids = Some(vec![Some(sequence_id); n]);
     }
 
     // -- Positional mapping (all raise NotImplementedError) -------------
@@ -699,22 +799,22 @@ impl PyEncoding {
         for enc_py in &encodings {
             let enc = enc_py.borrow(py);
             ids.extend_from_slice(&enc.ids);
-            attention_mask.extend_from_slice(&enc.attention_mask);
-            type_ids.extend_from_slice(&enc.type_ids);
-            special_tokens_mask.extend_from_slice(&enc.special_tokens_mask);
+            attention_mask.extend_from_slice(&enc.materialized_attention_mask());
+            type_ids.extend_from_slice(&enc.materialized_type_ids());
+            special_tokens_mask.extend_from_slice(&enc.materialized_special_tokens_mask());
             n_sequences += enc.n_sequences;
-            seq_ids.extend_from_slice(&enc._sequence_ids);
-            word_ids.extend_from_slice(&enc._word_ids);
+            seq_ids.extend_from_slice(&enc.materialized_sequence_ids());
+            word_ids.extend_from_slice(&enc.materialized_word_ids());
         }
 
         PyEncoding {
             ids,
-            attention_mask,
-            type_ids,
-            special_tokens_mask,
+            attention_mask: Some(attention_mask),
+            type_ids: Some(type_ids),
+            special_tokens_mask: Some(special_tokens_mask),
             n_sequences,
-            _sequence_ids: seq_ids,
-            _word_ids: word_ids,
+            _sequence_ids: Some(seq_ids),
+            _word_ids: Some(word_ids),
         }
     }
 }
@@ -742,8 +842,7 @@ struct PaddingParams {
 }
 
 fn build_encoding(ids: Vec<u32>, pad: Option<&PaddingParams>, target: usize) -> PyEncoding {
-    let n = ids.len();
-    let mut enc = PyEncoding::make(ids, vec![1u32; n]);
+    let mut enc = PyEncoding::make(ids);
     if let Some(p) = pad {
         enc.pad(target, &p.direction, p.pad_id, p.pad_type_id, &p.pad_token);
     }
@@ -1448,9 +1547,7 @@ impl PyTokenizer {
                     .map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        let n = ids.len();
-
-        Py::new(py, PyEncoding::make(ids, vec![1u32; n]))
+        Py::new(py, PyEncoding::make(ids))
     }
 
     /// Encode a batch of inputs in parallel.
@@ -1535,8 +1632,7 @@ impl PyTokenizer {
         }
         let ids = encoding.borrow(py).ids.clone();
         let new_ids = self.read().inner.post_process(ids, true);
-        let n = new_ids.len();
-        Py::new(py, PyEncoding::make(new_ids, vec![1u32; n]))
+        Py::new(py, PyEncoding::make(new_ids))
     }
 
     /// Return the number of special tokens added for a single or pair sequence.
@@ -1651,9 +1747,9 @@ mod tests {
         enc.pad(5, "right", 0u32, 1u32, "[PAD]");
 
         assert_eq!(enc.ids, vec![10u32, 20, 30, 0, 0]);
-        assert_eq!(enc.attention_mask, vec![1u32, 1, 1, 0, 0]);
+        assert_eq!(enc.materialized_attention_mask(), vec![1u32, 1, 1, 0, 0]);
         assert_eq!(
-            enc.type_ids,
+            enc.materialized_type_ids(),
             vec![0u32, 0, 0, 1, 1],
             "padded positions should carry pad_type_id=1 in type_ids"
         );
@@ -1674,8 +1770,8 @@ mod tests {
         let enc = build_encoding(vec![10u32, 20, 30], Some(&pad), 5);
 
         assert_eq!(enc.ids, vec![10u32, 20, 30, 0, 0]);
-        assert_eq!(enc.attention_mask, vec![1u32, 1, 1, 0, 0]);
-        assert_eq!(enc.type_ids, vec![0u32, 0, 0, 1, 1]);
+        assert_eq!(enc.materialized_attention_mask(), vec![1u32, 1, 1, 0, 0]);
+        assert_eq!(enc.materialized_type_ids(), vec![0u32, 0, 0, 1, 1]);
     }
 
     #[test]
@@ -1691,8 +1787,8 @@ mod tests {
         let enc = build_encoding(vec![10u32, 20, 30], Some(&pad), 5);
 
         assert_eq!(enc.ids, vec![0u32, 0, 10, 20, 30]);
-        assert_eq!(enc.attention_mask, vec![0u32, 0, 1, 1, 1]);
-        assert_eq!(enc.type_ids, vec![7u32, 7, 0, 0, 0]);
+        assert_eq!(enc.materialized_attention_mask(), vec![0u32, 0, 1, 1, 1]);
+        assert_eq!(enc.materialized_type_ids(), vec![7u32, 7, 0, 0, 0]);
     }
 }
 

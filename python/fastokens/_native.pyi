@@ -26,7 +26,6 @@ class Encoding:
     ) -> dict[str, Any]:
         """Move selected fields into numpy.uint32 arrays and drain the encoding."""
         ...
-
     # Properties that raise NotImplementedError
     @property
     def tokens(self) -> list[str]: ...

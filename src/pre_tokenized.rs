@@ -6,6 +6,8 @@ use rayon::prelude::*;
 /// this threshold the rayon overhead exceeds the parallelism gain.
 const PARALLEL_THRESHOLD: usize = 16;
 
+type TokenizedBucket = (Vec<u32>, Vec<usize>);
+
 #[inline]
 fn content_hash(bytes: &[u8]) -> u64 {
     let mut state = bytes.len() as u64;
@@ -229,7 +231,7 @@ impl PreTokenizedString {
             buckets[bucket].push(split.clone());
         }
         pool.install(|| {
-            let bucket_results: Result<Vec<(Vec<u32>, Vec<usize>)>, String> = buckets
+            let bucket_results: Result<Vec<TokenizedBucket>, String> = buckets
                 .into_par_iter()
                 .map(|bucket| {
                     let mut ids = Vec::with_capacity(bucket.len() * 3);

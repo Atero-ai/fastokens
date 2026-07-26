@@ -79,3 +79,7 @@ required-features = ["hf-hub"]
 [[example]]
 name = "simple_bench"
 required-features = ["hf-hub"]
+
+[[example]]
+name = "long_context_bench"
+required-features = ["hf-hub"]

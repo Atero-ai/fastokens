@@ -22,6 +22,11 @@ type Vocab = HashMap<String, u32>;
 
 const INVALID_TOKEN: u32 = u32::MAX;
 
+/// Pretokens with at most this many initial (per-byte) symbols use the
+/// stack-resident linear-scan merge instead of the heap. Sized so the stack
+/// arrays fit in registers/L1 and `u8` linked-list indices stay in range.
+const SMALL_MERGE_MAX: usize = 32;
+
 /// Open-addressing hash table for merge lookups.
 #[derive(Clone, PartialEq)]
 struct MergeMap {
@@ -103,6 +108,7 @@ fn fx_hash(key: u64) -> u64 {
 }
 
 /// FxHash-based [`BuildHasher`] for the token cache.
+#[derive(Clone, Default)]
 struct FxBuildHasher;
 
 impl std::hash::BuildHasher for FxBuildHasher {
@@ -142,8 +148,6 @@ impl std::hash::Hasher for FxStrHasher {
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 const FLAT_CACHE_BITS: usize = 16;
-const FLAT_CACHE_SIZE: usize = 1 << FLAT_CACHE_BITS;
-const FLAT_CACHE_MASK: usize = FLAT_CACHE_SIZE - 1;
 const EMPTY_SLOT: u64 = 0;
 
 #[derive(Clone, Copy)]
@@ -156,11 +160,10 @@ struct CacheSlot {
     key_offset: u32,
 }
 
-/// Maximum load factor before the cache is cleared.
-const FLAT_CACHE_MAX_LOAD: usize = FLAT_CACHE_SIZE * 3 / 4;
-
 struct FlatCache {
     bpe_id: usize,
+    mask: usize,
+    max_load: usize,
     slots: Vec<CacheSlot>,
     pool: Vec<u32>,
     key_pool: Vec<u8>,
@@ -169,8 +172,17 @@ struct FlatCache {
 
 impl FlatCache {
     fn new() -> Self {
+        Self::with_bits(FLAT_CACHE_BITS)
+    }
+
+    /// A flat cache with `1 << bits` slots. The thread-local L1 uses
+    /// [`FLAT_CACHE_BITS`]; the shared-cache shards use fewer bits each.
+    fn with_bits(bits: usize) -> Self {
+        let size = 1usize << bits;
         Self {
             bpe_id: 0,
+            mask: size - 1,
+            max_load: size * 3 / 4,
             slots: vec![
                 CacheSlot {
                     hash: EMPTY_SLOT,
@@ -179,10 +191,10 @@ impl FlatCache {
                     key_len: 0,
                     key_offset: 0,
                 };
-                FLAT_CACHE_SIZE
+                size
             ],
-            pool: Vec::with_capacity(256 * 1024),
-            key_pool: Vec::with_capacity(512 * 1024),
+            pool: Vec::new(),
+            key_pool: Vec::new(),
             count: 0,
         }
     }
@@ -222,7 +234,7 @@ impl FlatCache {
     fn get(&self, key: &str, out: &mut Vec<u32>) -> bool {
         let hash = Self::hash_str(key);
         let key_bytes = key.as_bytes();
-        let mut idx = hash as usize & FLAT_CACHE_MASK;
+        let mut idx = hash as usize & self.mask;
         loop {
             let slot = unsafe { self.slots.get_unchecked(idx) };
             if slot.hash == hash {
@@ -238,18 +250,18 @@ impl FlatCache {
             if slot.hash == EMPTY_SLOT {
                 return false;
             }
-            idx = (idx + 1) & FLAT_CACHE_MASK;
+            idx = (idx + 1) & self.mask;
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, key: &str, ids: &[u32]) {
-        if self.count >= FLAT_CACHE_MAX_LOAD {
+        if self.count >= self.max_load {
             self.clear();
         }
         let hash = Self::hash_str(key);
         let key_bytes = key.as_bytes();
-        let mut idx = hash as usize & FLAT_CACHE_MASK;
+        let mut idx = hash as usize & self.mask;
         loop {
             let slot = unsafe { self.slots.get_unchecked(idx) };
             let h = slot.hash;
@@ -288,7 +300,7 @@ impl FlatCache {
                     return;
                 }
             }
-            idx = (idx + 1) & FLAT_CACHE_MASK;
+            idx = (idx + 1) & self.mask;
         }
     }
 }
@@ -300,45 +312,50 @@ thread_local! {
 
 const CACHE_SHARDS: usize = 64;
 
+/// Slot bits per shared-cache shard: 64 shards x 4096 slots = 256k entries.
+const SHARED_SHARD_BITS: usize = 12;
+
+/// Cross-thread token cache: [`CACHE_SHARDS`] mutex-guarded [`FlatCache`]
+/// shards. Compared to the previous `HashMap<String, Vec<u32>>` shards this
+/// is allocation-free per insert (keys and ids are copied into per-shard
+/// pools that retain capacity across clears) and bounded (a shard clears at
+/// 3/4 load instead of growing forever), which both removes the two heap
+/// allocations per cold pretoken and fixes unbounded memory growth on
+/// diverse long-running traffic.
 struct SharedCache {
-    shards: Vec<Mutex<FxHashMap<String, Vec<u32>>>>,
+    shards: Vec<Mutex<FlatCache>>,
 }
 
 impl SharedCache {
     fn new() -> Self {
         Self {
             shards: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::with_hasher(FxBuildHasher)))
+                .map(|_| Mutex::new(FlatCache::with_bits(SHARED_SHARD_BITS)))
                 .collect(),
         }
     }
 
+    /// Shard selector. Uses the TOP bits of the same hash `FlatCache`
+    /// indexes slots with (low bits), so the two are independent.
     #[inline]
     fn shard_index(key: &str) -> usize {
-        let bytes = key.as_bytes();
-        let mut h: u64 = bytes.len() as u64;
-        for &b in &bytes[..bytes.len().min(8)] {
-            h = h.wrapping_add(b as u64).wrapping_mul(0x9E3779B97F4A7C15);
-        }
-        h as usize & (CACHE_SHARDS - 1)
+        (FlatCache::hash_str(key) >> (64 - 6)) as usize & (CACHE_SHARDS - 1)
     }
 
     #[inline]
     fn get_into(&self, key: &str, out: &mut Vec<u32>) -> bool {
-        let shard = self.shards[Self::shard_index(key)].lock().unwrap();
-        if let Some(ids) = shard.get(key) {
-            out.extend_from_slice(ids);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn insert(&self, key: String, value: Vec<u32>) {
-        self.shards[Self::shard_index(&key)]
+        self.shards[Self::shard_index(key)]
             .lock()
             .unwrap()
-            .insert(key, value);
+            .get(key, out)
+    }
+
+    #[inline]
+    fn insert(&self, key: &str, ids: &[u32]) {
+        self.shards[Self::shard_index(key)]
+            .lock()
+            .unwrap()
+            .insert(key, ids);
     }
 }
 
@@ -588,7 +605,7 @@ pub struct Bpe {
     shared_cache: SharedCache,
     fused_shared_cache: SharedCache,
     id_to_token: Vec<String>,
-    token_to_id: HashMap<String, u32>,
+    token_to_id: FxHashMap<String, u32>,
     byte_to_initial_token: [u32; 256],
     ranked_merge_map: RankedMergeMap,
     byte_pair_initial: Vec<(u32, u32)>,
@@ -802,7 +819,11 @@ impl Bpe {
             shared_cache: SharedCache::new(),
             fused_shared_cache: SharedCache::new(),
             id_to_token,
-            token_to_id: vocab.clone(),
+            token_to_id: {
+                let mut m = HashMap::with_capacity_and_hasher(vocab.len(), FxBuildHasher);
+                m.extend(vocab.iter().map(|(k, v)| (k.clone(), *v)));
+                m
+            },
             byte_to_initial_token,
             ranked_merge_map,
             byte_pair_initial,
@@ -908,7 +929,7 @@ impl Bpe {
             }
             c.insert(input, ids);
         });
-        self.shared_cache.insert(input.to_string(), ids.to_vec());
+        self.shared_cache.insert(input, ids);
 
         Ok(())
     }
@@ -955,12 +976,154 @@ impl Bpe {
         })
     }
 
+    /// Linear-scan BPE merge for short pretokens (`n <= SMALL_MERGE_MAX`
+    /// initial symbols). Avoids the `BinaryHeap` entirely: a stack-resident
+    /// doubly-linked list plus a per-position rank array, find-min by a short
+    /// scan over stack `u32`s, merge (O(1) pointer update), then refresh only
+    /// the two neighbor pairs. At these sizes this beats the heap's
+    /// sift/stale-entry traffic and does zero heap allocation.
+    ///
+    /// Produces the identical token sequence as [`run_merge_loop`]: both
+    /// process the globally lowest-`(rank, pos)` active pair each step (the
+    /// heap's `MergeEntry` key is `(rank << 32) | pos`; the scan's strict
+    /// `<` keeps the leftmost/lowest-`pos` position on ties). Enforced by
+    /// `merge_small_matches_heap` differential test. `ids[..n]` are the
+    /// per-byte initial token ids.
+    fn merge_small_raw(
+        &self,
+        bytes: &[u8],
+        ids: &mut [u32; SMALL_MERGE_MAX],
+        n: usize,
+        out: &mut Vec<u32>,
+    ) {
+        let mut next = [0u8; SMALL_MERGE_MAX];
+        let mut prev = [0u8; SMALL_MERGE_MAX];
+        let mut ranks = [u32::MAX; SMALL_MERGE_MAX];
+        let mut new_ids = [0u32; SMALL_MERGE_MAX];
+        for i in 0..n {
+            next[i] = (i + 1) as u8;
+            prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
+        }
+        // Round-1 ranks via the dense byte-pair table: one direct-indexed
+        // load per pair instead of a CSR neighbor scan.
+        for i in 0..n - 1 {
+            let (rank, new_id) =
+                self.byte_pair_initial[bytes[i] as usize * 256 + bytes[i + 1] as usize];
+            if rank != u32::MAX {
+                ranks[i] = rank;
+                new_ids[i] = new_id;
+            }
+        }
+        loop {
+            let mut best = u32::MAX;
+            let mut best_i = 0usize;
+            for (i, &rank) in ranks[..n - 1].iter().enumerate() {
+                if rank < best {
+                    best = rank;
+                    best_i = i;
+                }
+            }
+            if best == u32::MAX {
+                break;
+            }
+            let i = best_i;
+            ids[i] = new_ids[i];
+            let dead = next[i] as usize;
+            let new_right = next[dead] as usize;
+            next[i] = new_right as u8;
+            ranks[dead] = u32::MAX;
+            if new_right < n {
+                prev[new_right] = i as u8;
+                match self.merge_adj.get(ids[i], ids[new_right]) {
+                    Some((rank, new_id)) => {
+                        ranks[i] = rank;
+                        new_ids[i] = new_id;
+                    }
+                    None => ranks[i] = u32::MAX,
+                }
+            } else {
+                ranks[i] = u32::MAX;
+            }
+            let left = prev[i] as usize;
+            if left < n {
+                match self.merge_adj.get(ids[left], ids[i]) {
+                    Some((rank, new_id)) => {
+                        ranks[left] = rank;
+                        new_ids[left] = new_id;
+                    }
+                    None => ranks[left] = u32::MAX,
+                }
+            }
+        }
+        let mut i = 0usize;
+        while i < n {
+            out.push(ids[i]);
+            i = next[i] as usize;
+        }
+    }
+
+    /// `ignore_merges` whole-pretoken lookup: is the ByteLevel-encoded form
+    /// of the entire pretoken a single vocab token? Encodes into a stack
+    /// buffer for short pretokens (`BYTE_TO_CHAR` codepoints are <= U+0143,
+    /// so <= 2 UTF-8 bytes per input byte) instead of allocating a `String`
+    /// per cold pretoken; falls back to a heap `String` only for long ones.
+    #[inline]
+    fn whole_pretoken_id(&self, raw: &str) -> Option<u32> {
+        const STACK: usize = 128;
+        let bytes = raw.as_bytes();
+        if bytes.len() * 2 <= STACK {
+            let mut buf = [0u8; STACK];
+            let mut n = 0;
+            for &b in bytes {
+                n += BYTE_TO_CHAR[b as usize].encode_utf8(&mut buf[n..]).len();
+            }
+            // SAFETY: buf[..n] is a concatenation of `char::encode_utf8`
+            // outputs, hence valid UTF-8.
+            let encoded = unsafe { std::str::from_utf8_unchecked(&buf[..n]) };
+            self.token_to_id.get(encoded).copied()
+        } else {
+            let mut encoded = String::with_capacity(bytes.len() * 2);
+            for &b in bytes {
+                encoded.push(BYTE_TO_CHAR[b as usize]);
+            }
+            self.token_to_id.get(encoded.as_str()).copied()
+        }
+    }
+
     /// Priority-queue BPE merge on raw (pre-ByteLevel) bytes.
     fn merge_all_raw_into(&self, raw_input: &str, out: &mut Vec<u32>) -> Result<()> {
         if raw_input.is_empty() {
             return Ok(());
         }
 
+        // Short pretokens (the common case) skip the heap + thread-local
+        // scratch and use the stack-resident linear-scan merge. `n` initial
+        // symbols == byte length, so the tier is known up front.
+        let bytes = raw_input.as_bytes();
+        if bytes.len() <= SMALL_MERGE_MAX {
+            let n = bytes.len();
+            let mut ids = [0u32; SMALL_MERGE_MAX];
+            for (i, &byte) in bytes.iter().enumerate() {
+                let id = self.byte_to_initial_token[byte as usize];
+                if id == INVALID_TOKEN {
+                    return Err(format!("byte 0x{byte:02x} has no token in vocabulary"));
+                }
+                ids[i] = id;
+            }
+            if n == 1 {
+                out.push(ids[0]);
+            } else {
+                self.merge_small_raw(bytes, &mut ids, n, out);
+            }
+            return Ok(());
+        }
+
+        self.merge_all_raw_heap_into(raw_input, out)
+    }
+
+    /// Reference heap implementation used for long pretokens and as the
+    /// correctness oracle for the short linear-scan tier.
+    fn merge_all_raw_heap_into(&self, raw_input: &str, out: &mut Vec<u32>) -> Result<()> {
         TL_MERGE_SCRATCH.with(|s| {
             let mut scratch = s.borrow_mut();
             scratch.symbols.clear();
@@ -1124,15 +1287,11 @@ impl Bpe {
             return Ok(());
         }
 
-        if self.ignore_merges {
-            let mut encoded = String::with_capacity(raw_input.len());
-            for &byte in raw_input.as_bytes() {
-                encoded.push(BYTE_TO_CHAR[byte as usize]);
-            }
-            if let Some(&id) = self.token_to_id.get(encoded.as_str()) {
-                out.push(id);
-                return Ok(());
-            }
+        if self.ignore_merges
+            && let Some(id) = self.whole_pretoken_id(raw_input)
+        {
+            out.push(id);
+            return Ok(());
         }
 
         self.merge_all_raw_into(raw_input, out)?;
@@ -1146,8 +1305,7 @@ impl Bpe {
             }
             c.insert(raw_input, ids);
         });
-        self.fused_shared_cache
-            .insert(raw_input.to_string(), ids.to_vec());
+        self.fused_shared_cache.insert(raw_input, ids);
 
         Ok(())
     }
@@ -1185,24 +1343,18 @@ impl Bpe {
                         continue;
                     }
 
-                    if self.ignore_merges {
-                        let mut encoded = String::with_capacity(text.len());
-                        for &byte in text.as_bytes() {
-                            encoded.push(BYTE_TO_CHAR[byte as usize]);
-                        }
-                        if let Some(&id) = self.token_to_id.get(encoded.as_str()) {
-                            out.push(id);
-                            cache.insert(text, &out[start..]);
-                            continue;
-                        }
+                    if self.ignore_merges
+                        && let Some(id) = self.whole_pretoken_id(text)
+                    {
+                        out.push(id);
+                        cache.insert(text, &out[start..]);
+                        continue;
                     }
 
                     self.merge_all_raw_into(text, out)?;
 
                     cache.insert(text, &out[start..]);
-                    let key = text.to_string();
-                    let val = out[start..].to_vec();
-                    self.fused_shared_cache.insert(key, val);
+                    self.fused_shared_cache.insert(text, &out[start..]);
                 }
             }
             Ok(())
@@ -1329,6 +1481,32 @@ mod tests {
     fn repeated_merge() {
         let bpe = test_bpe();
         assert_eq!(bpe.tokenize("abab").unwrap(), vec![4, 4]);
+    }
+
+    #[test]
+    fn merge_small_matches_heap() {
+        let bpe = test_bpe();
+        let alphabet = [b'a', b'b', b'c', b'd'];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+
+        for len in 1..=SMALL_MERGE_MAX {
+            for _ in 0..512 {
+                let mut bytes = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    bytes.push(alphabet[state as usize & 3]);
+                }
+                let input = std::str::from_utf8(&bytes).unwrap();
+                let mut small = Vec::new();
+                let mut heap = Vec::new();
+
+                bpe.merge_all_raw_into(input, &mut small).unwrap();
+                bpe.merge_all_raw_heap_into(input, &mut heap).unwrap();
+                assert_eq!(small, heap, "short merge mismatch for {input:?}");
+            }
+        }
     }
 
     #[test]

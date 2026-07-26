@@ -514,6 +514,7 @@ dependencies = [
  "fancy-regex",
  "hf-hub",
  "icu_normalizer",
+ "icu_properties",
  "indicatif 0.18.4",
  "memchr",
  "minijinja",

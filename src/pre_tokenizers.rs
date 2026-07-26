@@ -1,4 +1,6 @@
 pub(crate) mod byte_level;
+pub(crate) mod fast_split;
+pub(crate) mod fast_split_o200k;
 mod split;
 
 use crate::{

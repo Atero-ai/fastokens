@@ -51,6 +51,7 @@ serde_json = { version = "1.0.149", features = ["preserve_order"] }
 strum = { version = "0.27.2", features = ["derive"] }
 thiserror = "2.0.18"
 icu_normalizer = "2"
+icu_properties = "2"
 
 [dev-dependencies]
 anyhow = "1"

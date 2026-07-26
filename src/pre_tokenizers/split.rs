@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::pre_tokenized::{PreTokenizedString, Split as PtSplit};
 
+use super::fast_split::FastSplitScheme;
+
 use super::Error;
 
 // Thread-local cache of previous Split results for incremental re-use.
@@ -154,6 +156,10 @@ pub struct Split {
     /// Compiled opportunistically for all patterns; `None` only if PCRE2
     /// cannot handle the pattern syntax.
     pcre2_regexes: Option<Vec<Pcre2Regex>>,
+    /// Hand-specialized scanner for byte-for-byte recognized patterns; the
+    /// fastest tier, tried before PCRE2. `None` for unknown patterns.
+    #[serde(skip)]
+    fast_scheme: Option<FastSplitScheme>,
 }
 
 /// Compile PCRE2 JIT regexes from `source`, returning `None` if PCRE2 cannot
@@ -208,12 +214,14 @@ impl TryFrom<SplitRaw> for Split {
         let source = raw.pattern.source();
         let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
         let regexes = compile_regexes(&source, max_parallel())?;
+        let fast_scheme = FastSplitScheme::from_pattern(&source);
         Ok(Self {
             id: SPLIT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             regexes,
             behavior: raw.behavior,
             invert: raw.invert,
             pcre2_regexes,
+            fast_scheme,
         })
     }
 }
@@ -229,12 +237,14 @@ impl Split {
         let regexes = compile_regexes(&source, max_parallel())?;
         let behavior: SplitBehavior = serde_json::from_value(Value::String(behavior.to_string()))?;
         let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
+        let fast_scheme = FastSplitScheme::from_pattern(&source);
         Ok(Self {
             id: SPLIT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             regexes,
             behavior,
             invert,
             pcre2_regexes,
+            fast_scheme,
         })
     }
 
@@ -251,6 +261,18 @@ impl Split {
         // step). Multi-split inputs (e.g. from an earlier Sequence step)
         // go through the generic per-split path which still uses PCRE2 via
         // find_segments.
+        // Fastest tier: a hand-specialized scanner for a byte-for-byte
+        // recognized pattern. Its spans tile the text exactly like the
+        // regex's find_iter (verified by differential tests in fast_split),
+        // and Isolated + !invert means every span is its own split. Works
+        // per split, so multi-split inputs are covered too.
+        if let Some(scheme) = self.fast_scheme
+            && self.behavior == SplitBehavior::Isolated
+            && !self.invert
+        {
+            return Self::pre_tokenize_fast_scheme(scheme, pts);
+        }
+
         if self.pcre2_regexes.is_some()
             && self.behavior == SplitBehavior::Isolated
             && !self.invert
@@ -288,6 +310,76 @@ impl Split {
 
         pts.refine_splits(new_splits);
         Ok(())
+    }
+
+    /// Fastest path: hand-specialized scanner for a recognized pattern
+    /// with Isolated behavior. Every scanner span becomes one split; the
+    /// patterns' alternations cover every char, so there are no gaps.
+    fn pre_tokenize_fast_scheme(
+        scheme: FastSplitScheme,
+        pts: &mut PreTokenizedString,
+    ) -> Result<(), Error> {
+        let mut new_splits = Vec::with_capacity(pts.splits().len().max(pts.buffer().len() / 4));
+        for split in pts.splits() {
+            if split.token_id.is_some() {
+                new_splits.push(split.clone());
+                continue;
+            }
+            let text = pts.split_text(split);
+            if text.is_empty() {
+                continue;
+            }
+            let base = split.range.start;
+            let bytes = text.as_bytes();
+            if bytes.len() >= 2 * MIN_CHUNK_SIZE {
+                Self::scan_scheme_parallel(scheme, bytes, base, &mut new_splits);
+            } else {
+                scan_scheme_into(scheme, bytes, base, 0, bytes.len(), &mut new_splits);
+            }
+        }
+        pts.refine_splits(new_splits);
+        Ok(())
+    }
+
+    /// Scan a large text with the specialized scanner across threads.
+    ///
+    /// The text is cut at scheme-safe boundaries (points no pretoken can
+    /// cross, see [`FastSplitScheme::find_safe_boundary`]), each chunk is
+    /// scanned independently, and the per-chunk splits are concatenated in
+    /// order — producing exactly the sequential result.
+    fn scan_scheme_parallel(
+        scheme: FastSplitScheme,
+        bytes: &[u8],
+        base: usize,
+        out: &mut Vec<PtSplit>,
+    ) {
+        let n_chunks = max_parallel().min(bytes.len() / MIN_CHUNK_SIZE).max(1);
+        let step = bytes.len() / n_chunks;
+        let mut bounds = vec![0usize];
+        for i in 1..n_chunks {
+            let target = (i * step).max(*bounds.last().unwrap());
+            // Search up to one full chunk ahead for a safe boundary; texts
+            // without one (no newlines) simply get fewer chunks.
+            let limit = (target + step).min(bytes.len());
+            if let Some(b) = scheme.find_safe_boundary(bytes, target, limit) {
+                bounds.push(b);
+            }
+        }
+        bounds.push(bytes.len());
+
+        let chunk_splits: Vec<Vec<PtSplit>> = bounds
+            .windows(2)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|w| {
+                let mut splits = Vec::with_capacity((w[1] - w[0]) / 4);
+                scan_scheme_into(scheme, bytes, base, w[0], w[1], &mut splits);
+                splits
+            })
+            .collect();
+        for splits in chunk_splits {
+            out.extend(splits);
+        }
     }
 
     /// Fast path for any pattern with PCRE2 JIT + Isolated behavior.
@@ -879,6 +971,161 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // ── Fast-scheme scanner integration ─────────────────
+
+    /// The specialized scanner (sequential and parallel chunked) must produce
+    /// exactly the splits of the generic regex engines for its pattern.
+    #[test]
+    fn fast_scheme_matches_regex_path_including_parallel() {
+        use crate::pre_tokenizers::fast_split::{QWEN2_N3_PATTERN, QWEN2_PATTERN};
+
+        // Large mixed text so the parallel chunked path (>= 16 KB) runs;
+        // digit-heavy blocks exercise the Qwen2 (\p{N}) vs Qwen2N3
+        // (\p{N}{1,3}) difference.
+        let mut text = String::new();
+        let blocks = [
+            "The tokenizer's throughput won't regress, it'll improve.\n",
+            "  indented code(); // with 'quotes' and [brackets]\n",
+            "числа 123 и 4567 vs \u{00A0}nbsp\t tab 89012\r\n",
+            "日本語テキスト and emoji \u{1F600}\u{1F680}   \n\n",
+            "digits 1 22 333 4444 55555 ١٢٣٤ ๑๒๓ no-newline-tail ",
+        ];
+        for i in 0..2000 {
+            text.push_str(blocks[i % blocks.len()]);
+        }
+        assert!(text.len() >= 2 * MIN_CHUNK_SIZE);
+
+        for pattern in [QWEN2_PATTERN, QWEN2_N3_PATTERN] {
+            let fast = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            assert!(fast.fast_scheme.is_some(), "pattern not recognized");
+            let mut generic = fast.clone();
+            generic.fast_scheme = None;
+
+            for input in [&text[..], "short don't 123456\n", "", "   ", "\n\n\n"] {
+                let mut pts_fast = PreTokenizedString::from_text(input);
+                fast.pre_tokenize(&mut pts_fast).unwrap();
+                let mut pts_generic = PreTokenizedString::from_text(input);
+                generic.pre_tokenize(&mut pts_generic).unwrap();
+                assert_eq!(
+                    pts_fast.splits().len(),
+                    pts_generic.splits().len(),
+                    "split count mismatch on len={}",
+                    input.len()
+                );
+                assert_eq!(pts_fast.splits(), pts_generic.splits());
+            }
+        }
+    }
+
+    /// The Kimi (o200k-family) scanner must match the regex path through
+    /// `Split::pre_tokenize`, including the parallel chunked path, on
+    /// CJK-heavy text where Han runs and the class intersections matter.
+    #[test]
+    fn kimi_fast_scheme_matches_regex_path_including_parallel() {
+        use crate::pre_tokenizers::fast_split_o200k::KIMI_PATTERN;
+
+        let fast = Split::from_config(&json!({"Regex": KIMI_PATTERN}), "Isolated", false).unwrap();
+        assert!(fast.fast_scheme.is_some(), "kimi pattern not recognized");
+        let mut generic = fast.clone();
+        generic.fast_scheme = None;
+
+        let mut text = String::new();
+        let blocks = [
+            "中文abc123混合 HTTPResponse camelCase don't\n",
+            "你好，世界！ Hello 漢字とかな カタカナ\n",
+            "punct!!! ...\u{3007}numeral 々repeat vs \u{00A0}nbsp\ttab\r\n",
+            "MÜNCHEN café'll ½ ⅷ ٣ emoji \u{1F600}\u{1F680}   \n\n",
+            "no-newline-tail 上下文 模型 ",
+        ];
+        for i in 0..2000 {
+            text.push_str(blocks[i % blocks.len()]);
+        }
+        assert!(text.len() >= 2 * MIN_CHUNK_SIZE);
+
+        for input in [&text[..], "中文 short 123\n", "", "  中 ", "日本\n\n"] {
+            let mut pts_fast = PreTokenizedString::from_text(input);
+            fast.pre_tokenize(&mut pts_fast).unwrap();
+            let mut pts_generic = PreTokenizedString::from_text(input);
+            generic.pre_tokenize(&mut pts_generic).unwrap();
+            assert_eq!(
+                pts_fast.splits(),
+                pts_generic.splits(),
+                "kimi split mismatch"
+            );
+        }
+    }
+
+    /// Regression for the O200k parallel safe-boundary bug: O200k's punct
+    /// tail `[\r\n/]*` lets a token absorb `\n/`, so a chunk boundary placed
+    /// between a `\n` and a following `/` is crossed (overlapping ranges).
+    /// This text mixes the `\n/` trap with legitimate `\n<letter>` boundaries
+    /// and is large enough (>= 2*MIN_CHUNK_SIZE) to run the parallel path, so
+    /// the fast scheme must still equal the generic engine.
+    #[test]
+    fn o200k_parallel_boundary_handles_slash_after_newline() {
+        use crate::pre_tokenizers::fast_split_o200k::O200K_PATTERN;
+
+        let fast = Split::from_config(&json!({"Regex": O200K_PATTERN}), "Isolated", false).unwrap();
+        assert!(fast.fast_scheme.is_some());
+        let mut generic = fast.clone();
+        generic.fast_scheme = None;
+
+        // `\n/` (the trap) alternating with `\nword` (a safe boundary), so the
+        // parallel splitter has real boundaries to pick and can land near a
+        // trap.
+        let mut text = String::new();
+        while text.len() < 4 * MIN_CHUNK_SIZE {
+            text.push_str("path.\n/to/file\nword done.\n//comment\nnext ");
+        }
+
+        let mut a = PreTokenizedString::from_text(&text);
+        fast.pre_tokenize(&mut a).unwrap();
+        let mut b = PreTokenizedString::from_text(&text);
+        generic.pre_tokenize(&mut b).unwrap();
+        assert_eq!(
+            a.splits(),
+            b.splits(),
+            "o200k parallel slash-boundary mismatch"
+        );
+    }
+
+    /// The o200k (gpt-oss) scanner must match the regex path through
+    /// `Split::pre_tokenize`, including the parallel chunked path.
+    #[test]
+    fn o200k_fast_scheme_matches_regex_path_including_parallel() {
+        use crate::pre_tokenizers::fast_split_o200k::O200K_PATTERN;
+
+        let fast = Split::from_config(&json!({"Regex": O200K_PATTERN}), "Isolated", false).unwrap();
+        assert!(fast.fast_scheme.is_some(), "o200k pattern not recognized");
+        let mut generic = fast.clone();
+        generic.fast_scheme = None;
+
+        let mut text = String::new();
+        let blocks = [
+            "camelCase HTTPResponse AxxB don't can'ts\n",
+            "punct!!! ...\n// comment slash/tail path/to/file\n",
+            "café ñiño MÜNCHEN числа 123 4567 89012\r\n",
+            "日本語 中文 mixed \u{00A0}nbsp\ttab ½ ⅷ ٣\n\n",
+            "no-newline-tail 'sound 3'ts ",
+        ];
+        for i in 0..2000 {
+            text.push_str(blocks[i % blocks.len()]);
+        }
+        assert!(text.len() >= 2 * MIN_CHUNK_SIZE);
+
+        for input in [&text[..], "short don't 123/x\n", "", "   ", ".\n//c"] {
+            let mut pts_fast = PreTokenizedString::from_text(input);
+            fast.pre_tokenize(&mut pts_fast).unwrap();
+            let mut pts_generic = PreTokenizedString::from_text(input);
+            generic.pre_tokenize(&mut pts_generic).unwrap();
+            assert_eq!(
+                pts_fast.splits(),
+                pts_generic.splits(),
+                "o200k split mismatch"
+            );
+        }
+    }
 
     // ── Behavior tests ──────────────────────────────────
 
@@ -1579,5 +1826,27 @@ mod tests {
             "cache reuse at boundary produced wrong splits; \
              lookahead context was stale"
         );
+    }
+}
+
+/// Run `scheme` over `bytes[start..end]` pushing one split per pretoken.
+/// `end` must be a scheme-safe boundary (or `bytes.len()`).
+fn scan_scheme_into(
+    scheme: FastSplitScheme,
+    bytes: &[u8],
+    base: usize,
+    start: usize,
+    end: usize,
+    out: &mut Vec<PtSplit>,
+) {
+    let mut pos = start;
+    while pos < end {
+        let next = scheme.advance(bytes, pos);
+        debug_assert!(pos < next && next <= end);
+        out.push(PtSplit {
+            range: base + pos..base + next,
+            token_id: None,
+        });
+        pos = next;
     }
 }

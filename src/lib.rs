@@ -261,6 +261,26 @@ impl Tokenizer {
         input: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Error> {
+        self.encode_inner(input, add_special_tokens, true)
+    }
+
+    /// Encode through the base tokenizer pipeline without recognizing added
+    /// vocabulary entries.
+    ///
+    /// Equivalent to [`Self::encode_with_special_tokens`] with
+    /// `add_special_tokens = false`, except that every added-token matcher is
+    /// bypassed. Normalization, pre-tokenization, model tokenization, and
+    /// post-processing are preserved.
+    pub fn encode_ordinary(&self, input: &str) -> Result<Vec<u32>, Error> {
+        self.encode_inner(input, false, false)
+    }
+
+    fn encode_inner(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        recognize_added_tokens: bool,
+    ) -> Result<Vec<u32>, Error> {
         if input.is_empty() {
             return if add_special_tokens {
                 Ok(self.post_process(Vec::new(), true))
@@ -269,8 +289,12 @@ impl Tokenizer {
             };
         }
 
-        // 1. Split on added tokens + normalize into a single buffer.
-        let mut pts = self.build_pre_tokenized(input);
+        // 1. Normalize the input, optionally recognizing added vocabulary.
+        let mut pts = if recognize_added_tokens {
+            self.build_pre_tokenized(input)
+        } else {
+            self.build_pre_tokenized_ordinary(input)
+        };
 
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
@@ -431,23 +455,7 @@ impl Tokenizer {
         if segments.len() == 1
             && let Segment::Text(text) = segments[0]
         {
-            let normalized = match &self.normalizer {
-                Some(n) => n.normalize(text),
-                None => std::borrow::Cow::Borrowed(text),
-            };
-            return match normalized {
-                std::borrow::Cow::Borrowed(_) => PreTokenizedString::from_text(text),
-                std::borrow::Cow::Owned(s) => {
-                    let len = s.len();
-                    PreTokenizedString::new(
-                        s,
-                        vec![PtSplit {
-                            range: 0..len,
-                            token_id: None,
-                        }],
-                    )
-                }
-            };
+            return self.build_pre_tokenized_ordinary(text);
         }
 
         let mut buffer = String::with_capacity(input.len());
@@ -482,6 +490,27 @@ impl Tokenizer {
         }
 
         PreTokenizedString::new(buffer, splits)
+    }
+
+    /// Normalize one input as a single text span, bypassing added vocabulary.
+    fn build_pre_tokenized_ordinary(&self, input: &str) -> PreTokenizedString {
+        let normalized = match &self.normalizer {
+            Some(normalizer) => normalizer.normalize(input),
+            None => std::borrow::Cow::Borrowed(input),
+        };
+        match normalized {
+            std::borrow::Cow::Borrowed(_) => PreTokenizedString::from_text(input),
+            std::borrow::Cow::Owned(buffer) => {
+                let len = buffer.len();
+                PreTokenizedString::new(
+                    buffer,
+                    vec![PtSplit {
+                        range: 0..len,
+                        token_id: None,
+                    }],
+                )
+            }
+        }
     }
 }
 
@@ -1958,3 +1987,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ordinary_tests;

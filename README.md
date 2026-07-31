@@ -1,7 +1,8 @@
 # ⚡ fastokens
 
 fastokens is a fast [BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) tokenizer for use with
-popular open-weight LLMs, built on top of a high-performance Rust backend.
+popular open-weight LLMs, built on top of a high-performance Rust backend. It loads both the
+HuggingFace `tokenizer.json` format and [tiktoken](https://github.com/openai/tiktoken) model files.
 
 `fastokens` can be installed from source:
 ```
@@ -72,6 +73,59 @@ from fastokens._native import Tokenizer
 tokenizer = Tokenizer.from_model("deepseek-ai/DeepSeek-V3.2")
 tokens = tokenizer.encode("A very long prompt that is now lightning fast.")
 ```
+
+### Loading a tiktoken model
+
+`fastokens` can also load [tiktoken](https://github.com/openai/tiktoken)
+model files (`tiktoken.model`, or OpenAI's `.tiktoken` files) in addition to
+`tokenizer.json`.
+
+A tiktoken model file only contains the byte-level BPE ranks — the
+pre-tokenization regex (`pat_str`) and the special tokens live in companion
+code, so they are supplied separately. For OpenAI's standard encodings, pass
+`encoding=` to use the built-in defaults:
+
+```python
+from fastokens import Tokenizer
+
+# cl100k_base (GPT-3.5 / GPT-4) or o200k_base (GPT-4o):
+tok = Tokenizer.from_tiktoken("cl100k_base.tiktoken", encoding="cl100k_base")
+tok.encode("Hello, world!").ids  # matches tiktoken's encode_ordinary
+```
+
+For any other model that ships a `tiktoken.model` (e.g. Kimi-K2), pass the
+model's own pattern and special tokens explicitly:
+
+```python
+tok = Tokenizer.from_tiktoken(
+    "tiktoken.model",
+    pattern=r"...the model's pat_str...",
+    special_tokens={"<|im_end|>": 163842, "<|im_user|>": 163843},
+)
+```
+
+The same is available in Rust via `Tokenizer::from_tiktoken_file`,
+`from_tiktoken_str`, and `from_tiktoken_ranks`, with `TiktokenConfig::cl100k_base()`
+/ `o200k_base()` presets. Special tokens are treated like HuggingFace added
+tokens (split out before the model, skippable on decode).
+
+For the `o200k` and Kimi pattern families, pre-tokenization uses a hand-written,
+parallelized Unicode scanner instead of a regex engine (its classification
+tables are built from the same `regex-syntax` data the reference matcher uses,
+so results are identical). This makes single-document ("1M context")
+tokenization several times faster than the regex path on those models.
+
+### Prefix cache (shared system prompts)
+
+For serving workloads where many requests share a long prefix — a common system
+prompt or a large shared context — an opt-in prefix cache tokenizes the shared
+prefix once and reuses its token ids, tokenizing only each request's unique
+tail. Enable it with `FASTOKENS_INPUT_CACHE=<capacity>` (number of recent
+prefixes to retain) or `Tokenizer::enable_input_cache(capacity)` in Rust; it is
+off by default. Reuse cuts are only ever made at hard pretoken boundaries, so
+results are bit-identical to tokenizing from scratch. On a ~1M-token shared
+prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
+reuses the whole encoding.
 
 ### Dynamo usage
 

@@ -1,5 +1,7 @@
 pub(crate) mod byte_level;
+pub(crate) mod scan;
 mod split;
+pub(crate) mod unicode_class;
 
 use crate::{
     json_structs::{PreTokenizerConfig, PreTokenizerKind},

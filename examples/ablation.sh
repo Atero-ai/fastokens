@@ -15,13 +15,22 @@ DEFAULT_DATASETS=(
 )
 DEFAULT_BATCH_SIZES=("seq" "1" "8" "32" "128")
 DEFAULT_MAX_SAMPLES=50
+# Tiktoken models are validated for output identicalness against `tiktoken`
+# (the reference for tiktoken models — HuggingFace `tokenizers` cannot load a
+# bare `tiktoken.model`). This exercises the o200k / Kimi scanner encode path.
+DEFAULT_TIKTOKEN_MODELS=("o200k_base" "kimi")
+PYTHON="${PYTHON:-python3}"
 
 # ── Parse arguments ───────────────────────────────────────────────────
 MODELS=()
 DATASETS=()
 BATCH_SIZES=()
+TIKTOKEN_MODELS=()
 MAX_SAMPLES="$DEFAULT_MAX_SAMPLES"
 OUTPUT_DIR=""
+TIKTOKEN_ONLY=0
+RUN_TIKTOKEN=1
+TIKTOKEN_FAILED=0
 
 usage() {
     cat <<EOF
@@ -34,8 +43,16 @@ Options:
   --datasets DATASETS    Comma-separated dataset list (default: LongBench-v2,ShareGPT52K)
   --batch-sizes SIZES    Comma-separated batch sizes; use "seq" for sequential (default: seq,1,8,32,128)
   -n, --max-samples N    Max samples per run (default: $DEFAULT_MAX_SAMPLES)
+  --tiktoken-models M    Comma-separated tiktoken models to validate vs tiktoken
+                         (default: o200k_base,kimi; choices: o200k_base,cl100k_base,kimi)
+  --tiktoken-only        Only run the tiktoken identicalness check (skip HF matrix)
+  --no-tiktoken          Skip the tiktoken identicalness check
   --output-dir DIR       Output directory (default: ablation_results_TIMESTAMP)
   -h, --help             Show this help
+
+Environment:
+  PYTHON                 Python interpreter for the tiktoken check (default: python3;
+                         must have fastokens + tiktoken installed, huggingface_hub for kimi)
 EOF
     exit 0
 }
@@ -45,6 +62,9 @@ while [[ $# -gt 0 ]]; do
         --models)     IFS=',' read -ra MODELS <<< "$2"; shift 2 ;;
         --datasets)   IFS=',' read -ra DATASETS <<< "$2"; shift 2 ;;
         --batch-sizes) IFS=',' read -ra BATCH_SIZES <<< "$2"; shift 2 ;;
+        --tiktoken-models) IFS=',' read -ra TIKTOKEN_MODELS <<< "$2"; shift 2 ;;
+        --tiktoken-only) TIKTOKEN_ONLY=1; shift ;;
+        --no-tiktoken)   RUN_TIKTOKEN=0; shift ;;
         -n|--max-samples) MAX_SAMPLES="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)    usage ;;
@@ -52,9 +72,40 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ ${#MODELS[@]} -eq 0 ]]      && MODELS=("${DEFAULT_MODELS[@]}")
-[[ ${#DATASETS[@]} -eq 0 ]]    && DATASETS=("${DEFAULT_DATASETS[@]}")
-[[ ${#BATCH_SIZES[@]} -eq 0 ]] && BATCH_SIZES=("${DEFAULT_BATCH_SIZES[@]}")
+[[ ${#MODELS[@]} -eq 0 ]]          && MODELS=("${DEFAULT_MODELS[@]}")
+[[ ${#DATASETS[@]} -eq 0 ]]        && DATASETS=("${DEFAULT_DATASETS[@]}")
+[[ ${#BATCH_SIZES[@]} -eq 0 ]]     && BATCH_SIZES=("${DEFAULT_BATCH_SIZES[@]}")
+[[ ${#TIKTOKEN_MODELS[@]} -eq 0 ]] && TIKTOKEN_MODELS=("${DEFAULT_TIKTOKEN_MODELS[@]}")
+
+# ── Tiktoken identicalness check (fastokens vs tiktoken) ──────────────
+# tiktoken models can't be loaded by HuggingFace `tokenizers`, so their
+# reference is `tiktoken`. Run before the HF matrix so a scanner/encode-path
+# regression is caught fast.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+run_tiktoken_validation() {
+    echo "Tiktoken identicalness — fastokens vs tiktoken"
+    echo "  models: ${TIKTOKEN_MODELS[*]}"
+    echo "══════════════════════════════════════════════════"
+    if ! "$PYTHON" -c "import fastokens, tiktoken" 2>/dev/null; then
+        echo "  SKIPPED: $PYTHON lacks fastokens+tiktoken (build with 'maturin develop --release'," \
+             "'pip install tiktoken huggingface_hub'); set PYTHON=<interp> to choose one."
+        return
+    fi
+    if "$PYTHON" "$SCRIPT_DIR/validate_tiktoken.py" "${TIKTOKEN_MODELS[@]}"; then
+        echo "  -> PASS: all tiktoken models identical to tiktoken"
+    else
+        TIKTOKEN_FAILED=1
+        echo "  -> FAIL: a tiktoken model diverged (see output above)"
+    fi
+    echo
+}
+
+if [[ $RUN_TIKTOKEN -eq 1 ]]; then
+    run_tiktoken_validation
+fi
+if [[ $TIKTOKEN_ONLY -eq 1 ]]; then
+    exit $TIKTOKEN_FAILED
+fi
 
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="ablation_results_$(date +%Y%m%d_%H%M%S)"
@@ -172,6 +223,14 @@ for model in "${MODELS[@]}"; do
     done
 done
 
-if [[ $failed -gt 0 ]]; then
+if [[ $RUN_TIKTOKEN -eq 1 ]]; then
+    if [[ $TIKTOKEN_FAILED -eq 0 ]]; then
+        echo "  Tiktoken identicalness: PASS (${TIKTOKEN_MODELS[*]})"
+    else
+        echo "  Tiktoken identicalness: FAIL"
+    fi
+fi
+
+if [[ $failed -gt 0 || $TIKTOKEN_FAILED -gt 0 ]]; then
     exit 1
 fi

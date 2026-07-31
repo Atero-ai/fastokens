@@ -2,7 +2,7 @@ use std::sync::RwLock;
 
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -399,7 +399,7 @@ impl TokenizerState {
         let Some(ref p) = self.pad else { return n };
         let base = p.length.unwrap_or(n).max(n);
         match p.pad_to_multiple_of {
-            Some(m) if m > 0 => (base + m - 1) / m * m,
+            Some(m) if m > 0 => base.div_ceil(m) * m,
             _ => base,
         }
     }
@@ -494,6 +494,71 @@ impl PyTokenizer {
             })
             .map_err(PyValueError::new_err)?;
         Self::build_from_str(&json, py)
+    }
+
+    /// Create a tokenizer from a tiktoken model file (e.g. `tiktoken.model`,
+    /// or OpenAI's `.tiktoken` files).
+    ///
+    /// A tiktoken model file contains only the byte-level BPE ranks. The
+    /// pre-tokenization regex (`pattern`) and `special_tokens` are not in the
+    /// file and must be supplied here — or pass `encoding="cl100k_base"` /
+    /// `"o200k_base"` to use the corresponding OpenAI defaults. An explicit
+    /// `pattern` / `special_tokens` overrides the preset.
+    #[staticmethod]
+    #[pyo3(signature = (path, pattern = None, special_tokens = None, encoding = None))]
+    fn from_tiktoken(
+        path: &str,
+        pattern: Option<String>,
+        special_tokens: Option<std::collections::HashMap<String, u32>>,
+        encoding: Option<String>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        use fastokens::TiktokenConfig;
+
+        let preset = match encoding.as_deref() {
+            Some(name) => Some(TiktokenConfig::from_preset(name).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown tiktoken encoding preset {name:?}; \
+                     expected 'cl100k_base' or 'o200k_base'"
+                ))
+            })?),
+            None => None,
+        };
+
+        let pattern = pattern
+            .or_else(|| preset.as_ref().map(|p| p.pattern.clone()))
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "a `pattern` (pre-tokenization regex) is required unless \
+                     `encoding` names a known preset",
+                )
+            })?;
+
+        let special_tokens: Vec<(String, u32)> = match special_tokens {
+            Some(map) => map.into_iter().collect(),
+            None => preset.map(|p| p.special_tokens).unwrap_or_default(),
+        };
+
+        let config = TiktokenConfig::new(pattern, special_tokens);
+
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| PyValueError::new_err(format!("cannot read {path}: {e}")))?;
+
+        let inner = py
+            .allow_threads(|| {
+                fastokens::Tokenizer::from_tiktoken_str(&contents, config)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyValueError::new_err)?;
+
+        Ok(Self {
+            state: RwLock::new(TokenizerState {
+                inner,
+                trunc: None,
+                pad: None,
+                post_processor_json: None,
+            }),
+        })
     }
 
     // ── Post-processor ────────────────────────────────────────────────
@@ -676,7 +741,7 @@ impl PyTokenizer {
             let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
             let base = p.length.unwrap_or(max_len).max(max_len);
             match p.pad_to_multiple_of {
-                Some(m) if m > 0 => (base + m - 1) / m * m,
+                Some(m) if m > 0 => base.div_ceil(m) * m,
                 _ => base,
             }
         });
@@ -688,6 +753,64 @@ impl PyTokenizer {
                 Py::new(py, build_encoding(ids, state.pad.as_ref(), target))
             })
             .collect()
+    }
+
+    /// Encode a batch into a single flat token buffer, for high-throughput bulk
+    /// tokenization (e.g. building a training corpus). Returns
+    /// `(ids, offsets)` where `ids` is the concatenated token ids of every input
+    /// as little-endian `uint32` bytes, and `offsets` is `len(inputs) + 1`
+    /// little-endian `uint64` values: input `i`'s tokens are
+    /// `ids[offsets[i]:offsets[i+1]]`. Decode with
+    /// `np.frombuffer(ids, np.uint32)` / `np.frombuffer(offsets, np.uint64)`.
+    ///
+    /// Unlike [`encode_batch`], this materializes no per-token Python objects —
+    /// the whole result is two buffers — which is what makes bulk encoding fast
+    /// from Python. Truncation is applied per input; padding does not apply
+    /// (the result is ragged, addressed by `offsets`).
+    #[pyo3(signature = (inputs, add_special_tokens = false))]
+    fn encode_batch_flat<'py>(
+        &self,
+        inputs: Vec<String>,
+        add_special_tokens: bool,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        use rayon::prelude::*;
+
+        let state = self.read();
+        let mut batch: Vec<Vec<u32>> = py.allow_threads(|| {
+            inputs
+                .par_iter()
+                .map(|s| {
+                    state
+                        .inner
+                        .encode_with_special_tokens(s.as_str(), add_special_tokens)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })?;
+        for ids in &mut batch {
+            state.do_truncate(ids);
+        }
+
+        // Concatenate into one flat id buffer and build cumulative offsets.
+        let total: usize = batch.iter().map(Vec::len).sum();
+        let mut flat: Vec<u32> = Vec::with_capacity(total);
+        let mut offsets: Vec<u64> = Vec::with_capacity(batch.len() + 1);
+        offsets.push(0);
+        for ids in &batch {
+            flat.extend_from_slice(ids);
+            offsets.push(flat.len() as u64);
+        }
+
+        // Reinterpret the id/offset buffers as bytes (same allocation) and copy
+        // them into Python `bytes` — no per-element Python objects.
+        // SAFETY: `u32`/`u64` slices reinterpret as byte slices of the same
+        // length in bytes; both are `Copy` with no padding.
+        let ids_bytes =
+            unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4) };
+        let off_bytes =
+            unsafe { std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 8) };
+        Ok((PyBytes::new(py, ids_bytes), PyBytes::new(py, off_bytes)))
     }
 
     // ── Post-processing ───────────────────────────────────────────────

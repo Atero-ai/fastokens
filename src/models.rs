@@ -66,6 +66,34 @@ impl Model {
         }
     }
 
+    /// Fused scan+BPE of one segment (see [`bpe::Bpe::tokenize_scanned_segment`]).
+    #[inline(always)]
+    pub fn tokenize_scanned_segment(
+        &self,
+        kind: crate::pre_tokenizers::scan::ScanKind,
+        seg: &str,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        match self {
+            Self::Bpe(bpe) => bpe.tokenize_scanned_segment(kind, seg, out),
+        }
+    }
+
+    /// Fused scan+BPE of one segment, recording prefix-cache reuse boundaries
+    /// (see [`bpe::Bpe::tokenize_scanned_segment_rec`]).
+    #[inline(always)]
+    pub fn tokenize_scanned_segment_rec(
+        &self,
+        kind: crate::pre_tokenizers::scan::ScanKind,
+        seg: &str,
+        out: &mut Vec<u32>,
+        bounds: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        match self {
+            Self::Bpe(bpe) => bpe.tokenize_scanned_segment_rec(kind, seg, out, bounds),
+        }
+    }
+
     /// Look up the string representation of a token ID.
     pub fn id_to_token(&self, id: u32) -> Option<&str> {
         match self {

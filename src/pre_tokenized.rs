@@ -6,17 +6,54 @@ use rayon::prelude::*;
 /// this threshold the rayon overhead exceeds the parallelism gain.
 const PARALLEL_THRESHOLD: usize = 16;
 
+/// On Apple Silicon, the number of performance (P) cores
+/// (`hw.perflevel0.logicalcpu`). BPE tokenization is a barrier-synchronized
+/// parallel stage, so scheduling work on the slower efficiency cores only adds
+/// straggler latency — the fastest point is exactly the P-core count.
+#[cfg(target_os = "macos")]
+fn perf_core_count() -> Option<usize> {
+    let name = c"hw.perflevel0.logicalcpu";
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as usize)
+}
+
+/// Default BPE worker-thread count. On homogeneous CPUs this is every logical
+/// core; on Apple Silicon's hybrid CPUs it is the performance-core count (the
+/// measured optimum — efficiency-core threads only slow the barrier down).
+fn default_bpe_threads() -> usize {
+    #[cfg(target_os = "macos")]
+    if let Some(p) = perf_core_count() {
+        return p;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
 /// Dedicated rayon thread pool for BPE tokenization.
-/// Using a fixed-size pool ensures the same threads are reused across calls,
-/// keeping their thread-local caches warm. Capped at 8 threads to stay within
-/// L2 cache locality on most architectures.
+///
+/// A fixed-size pool reuses the same threads across calls, keeping their
+/// thread-local caches warm. The size is [`default_bpe_threads`] capped by
+/// available parallelism, overridable with the `FASTOKENS_BPE_THREADS`
+/// environment variable.
 fn bpe_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
+        let avail = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let n = std::env::var("FASTOKENS_BPE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(default_bpe_threads)
+            .min(avail);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()
@@ -212,6 +249,99 @@ impl PreTokenizedString {
         }
         Ok(ids)
     }
+}
+
+/// Minimum buffer size before the fused scan+BPE encode splits across threads.
+const SCAN_FUSED_PARALLEL_MIN: usize = 64 * 1024;
+
+/// Fused scan+BPE driver for the scanner fast path: split the buffer at newline
+/// boundaries and run `per_chunk` (scan a segment into pretokens *and* BPE them)
+/// on each segment in parallel, concatenating results in order.
+///
+/// This is a single pass over the buffer — each segment's bytes are scanned and
+/// tokenized while still hot in cache — and never materializes a whole-document
+/// range list, unlike scanning to a `Vec<(u32,u32)>` then tokenizing it.
+pub fn tokenize_scanned<F>(buffer: &str, per_chunk: F) -> Result<Vec<u32>, String>
+where
+    F: Fn(&str) -> Result<Vec<u32>, String> + Sync,
+{
+    let bytes = buffer.as_bytes();
+    let pool = bpe_pool();
+    let threads = pool.current_num_threads();
+    if bytes.len() < SCAN_FUSED_PARALLEL_MIN || threads < 2 {
+        return per_chunk(buffer);
+    }
+
+    let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
+    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(bytes, n_chunks);
+    if segments.len() <= 1 {
+        return per_chunk(buffer);
+    }
+
+    pool.install(|| {
+        let parts: Result<Vec<Vec<u32>>, String> = segments
+            .par_iter()
+            .map(|&(s, e)| per_chunk(&buffer[s..e]))
+            .collect();
+        let parts = parts?;
+        let total: usize = parts.iter().map(Vec::len).sum();
+        let mut ids = Vec::with_capacity(total);
+        for part in parts {
+            ids.extend(part);
+        }
+        Ok(ids)
+    })
+}
+
+/// A chunk's token ids together with its `(byte_offset, token_index)` reuse
+/// boundaries — the payload a bounded scan produces for the prefix cache.
+type IdsWithBounds = (Vec<u32>, Vec<(u32, u32)>);
+
+/// Like [`tokenize_scanned`], but `per_chunk` also yields fine-grained reuse
+/// boundaries (local `(byte_offset, token_index)` within the chunk). This
+/// returns the concatenated ids and the boundaries mapped to global offsets,
+/// ascending, where `ids[..token_index]` is exactly the encoding of
+/// `buffer[..byte_offset]`. These are the offsets the prefix cache may cut a
+/// reused prefix at.
+pub fn tokenize_scanned_with_bounds<F>(buffer: &str, per_chunk: F) -> Result<IdsWithBounds, String>
+where
+    F: Fn(&str) -> Result<IdsWithBounds, String> + Sync,
+{
+    let bytes = buffer.as_bytes();
+    let pool = bpe_pool();
+    let threads = pool.current_num_threads();
+    if bytes.len() < SCAN_FUSED_PARALLEL_MIN || threads < 2 {
+        return per_chunk(buffer);
+    }
+
+    let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
+    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(bytes, n_chunks);
+    if segments.len() <= 1 {
+        return per_chunk(buffer);
+    }
+
+    pool.install(|| {
+        let parts: Result<Vec<IdsWithBounds>, String> = segments
+            .par_iter()
+            .map(|&(s, e)| per_chunk(&buffer[s..e]))
+            .collect();
+        let parts = parts?;
+        let total: usize = parts.iter().map(|(ids, _)| ids.len()).sum();
+        let n_bounds: usize = parts.iter().map(|(_, b)| b.len()).sum();
+        let mut ids = Vec::with_capacity(total);
+        let mut bounds = Vec::with_capacity(n_bounds);
+        for ((part_ids, part_bounds), &(s, _e)) in parts.iter().zip(segments.iter()) {
+            // Chunk-local (byte, token) → global by adding the chunk's byte start
+            // and the running token count before this chunk.
+            let base_tok = ids.len() as u32;
+            let base_byte = s as u32;
+            for &(bo, tk) in part_bounds {
+                bounds.push((base_byte + bo, base_tok + tk));
+            }
+            ids.extend_from_slice(part_ids);
+        }
+        Ok((ids, bounds))
+    })
 }
 
 #[cfg(test)]

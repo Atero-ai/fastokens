@@ -22,6 +22,11 @@ type Vocab = HashMap<String, u32>;
 
 const INVALID_TOKEN: u32 = u32::MAX;
 
+/// Pretokens with at most this many initial (per-byte) symbols use the
+/// stack-resident linear-scan merge instead of the heap. Sized so the stack
+/// arrays fit in registers/L1 and `u8` linked-list indices stay in range.
+const SMALL_MERGE_MAX: usize = 32;
+
 /// Open-addressing hash table for merge lookups.
 #[derive(Clone, PartialEq)]
 struct MergeMap {
@@ -103,6 +108,7 @@ fn fx_hash(key: u64) -> u64 {
 }
 
 /// FxHash-based [`BuildHasher`] for the token cache.
+#[derive(Clone, Default)]
 struct FxBuildHasher;
 
 impl std::hash::BuildHasher for FxBuildHasher {
@@ -142,8 +148,6 @@ impl std::hash::Hasher for FxStrHasher {
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 const FLAT_CACHE_BITS: usize = 16;
-const FLAT_CACHE_SIZE: usize = 1 << FLAT_CACHE_BITS;
-const FLAT_CACHE_MASK: usize = FLAT_CACHE_SIZE - 1;
 const EMPTY_SLOT: u64 = 0;
 
 #[derive(Clone, Copy)]
@@ -156,11 +160,10 @@ struct CacheSlot {
     key_offset: u32,
 }
 
-/// Maximum load factor before the cache is cleared.
-const FLAT_CACHE_MAX_LOAD: usize = FLAT_CACHE_SIZE * 3 / 4;
-
 struct FlatCache {
     bpe_id: usize,
+    mask: usize,
+    max_load: usize,
     slots: Vec<CacheSlot>,
     pool: Vec<u32>,
     key_pool: Vec<u8>,
@@ -169,8 +172,17 @@ struct FlatCache {
 
 impl FlatCache {
     fn new() -> Self {
+        Self::with_bits(FLAT_CACHE_BITS)
+    }
+
+    /// A flat cache with `1 << bits` slots. The thread-local L1 uses
+    /// [`FLAT_CACHE_BITS`]; the shared-cache shards use fewer bits each.
+    fn with_bits(bits: usize) -> Self {
+        let size = 1usize << bits;
         Self {
             bpe_id: 0,
+            mask: size - 1,
+            max_load: size * 3 / 4,
             slots: vec![
                 CacheSlot {
                     hash: EMPTY_SLOT,
@@ -179,10 +191,10 @@ impl FlatCache {
                     key_len: 0,
                     key_offset: 0,
                 };
-                FLAT_CACHE_SIZE
+                size
             ],
-            pool: Vec::with_capacity(256 * 1024),
-            key_pool: Vec::with_capacity(512 * 1024),
+            pool: Vec::new(),
+            key_pool: Vec::new(),
             count: 0,
         }
     }
@@ -222,7 +234,7 @@ impl FlatCache {
     fn get(&self, key: &str, out: &mut Vec<u32>) -> bool {
         let hash = Self::hash_str(key);
         let key_bytes = key.as_bytes();
-        let mut idx = hash as usize & FLAT_CACHE_MASK;
+        let mut idx = hash as usize & self.mask;
         loop {
             let slot = unsafe { self.slots.get_unchecked(idx) };
             if slot.hash == hash {
@@ -238,18 +250,18 @@ impl FlatCache {
             if slot.hash == EMPTY_SLOT {
                 return false;
             }
-            idx = (idx + 1) & FLAT_CACHE_MASK;
+            idx = (idx + 1) & self.mask;
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, key: &str, ids: &[u32]) {
-        if self.count >= FLAT_CACHE_MAX_LOAD {
+        if self.count >= self.max_load {
             self.clear();
         }
         let hash = Self::hash_str(key);
         let key_bytes = key.as_bytes();
-        let mut idx = hash as usize & FLAT_CACHE_MASK;
+        let mut idx = hash as usize & self.mask;
         loop {
             let slot = unsafe { self.slots.get_unchecked(idx) };
             let h = slot.hash;
@@ -288,57 +300,350 @@ impl FlatCache {
                     return;
                 }
             }
-            idx = (idx + 1) & FLAT_CACHE_MASK;
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
+// ── Pretoken cache (fused scanner path) ──────────────────────────────────────
+//
+// On natural-text corpora the fused encode loop is overwhelmingly a cache hit
+// (>90%), and the working set (unique pretokens) is far larger than L2/L3, so a
+// lookup is a near-random memory access. The design (after gigatoken's
+// `ShortPretokenCache`) makes each hit as cheap as possible:
+//
+// - The key is the pretoken's bytes packed into a `u128` (≤15 bytes, length in
+//   the top byte), so a match is a single 128-bit integer compare — no separate
+//   hashing of bytes plus a `memcmp` against a side pool.
+// - Each entry is exactly 32 bytes and holds up to 3 token ids INLINE (≈98% of
+//   pretokens encode to ≤2 tokens), so a hit reads one cache line and copies the
+//   ids straight out — no second load into an id arena. Longer id sequences
+//   spill to a pool (`v[0]` = offset).
+// - The table GROWS (doubling) instead of clearing at load, so the hot set
+//   survives on long-tail streaming — the previous clear-at-¾-load table threw
+//   away frequent entries and re-ran BPE for them. It starts small (a single
+//   short document keeps it tiny) and is capped, degrading to a clear only for
+//   pathologically diverse input beyond the cap.
+//
+// Pretokens longer than 15 bytes (rare in natural text) are not cached here;
+// they take the merge path directly.
+const PRETOKEN_CACHE_MIN_BITS: usize = 12;
+const PRETOKEN_CACHE_MAX_BITS: usize = 21; // ~2M entries × 32 B = 64 MiB cap
+const PT_INLINE: usize = 3;
+
+/// Prefetch the cache line at `p` into L1 (read hint). No memory effects, so
+/// any address is safe; a no-op on architectures without a prefetch intrinsic.
+#[inline(always)]
+fn prefetch_read(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: prefetch has no memory effects and reads nothing.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) p,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetch has no memory effects and reads nothing.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct PtEntry {
+    /// Packed pretoken bytes + length; `0` marks an empty slot.
+    key: u128,
+    /// Token count. `≤ PT_INLINE` → tokens in `v`; otherwise `v[0]` is the
+    /// offset of `len` ids in the spill pool.
+    len: u32,
+    v: [u32; PT_INLINE],
+}
+
+const _: () = assert!(std::mem::size_of::<PtEntry>() == 32);
+
+impl PtEntry {
+    #[inline(always)]
+    const fn empty() -> Self {
+        Self {
+            key: 0,
+            len: 0,
+            v: [0; PT_INLINE],
+        }
+    }
+}
+
+struct PretokenCache {
+    bpe_id: usize,
+    mask: usize,
+    cap: usize,
+    len: usize,
+    slots: Vec<PtEntry>,
+    spill: Vec<u32>,
+}
+
+impl PretokenCache {
+    fn new() -> Self {
+        let cap = 1usize << PRETOKEN_CACHE_MIN_BITS;
+        Self {
+            bpe_id: 0,
+            mask: cap - 1,
+            cap,
+            len: 0,
+            slots: vec![PtEntry::empty(); cap],
+            spill: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        for e in &mut self.slots {
+            e.key = 0;
+        }
+        self.spill.clear();
+        self.len = 0;
+    }
+
+    /// Pack ≤15 pretoken bytes + length into a nonzero `u128`, or `None` if the
+    /// pretoken is empty or too long to cache inline.
+    #[inline(always)]
+    fn pack_key(bytes: &[u8]) -> Option<u128> {
+        let n = bytes.len();
+        if n == 0 || n > 15 {
+            return None;
+        }
+        let mut buf = [0u8; 16];
+        buf[..n].copy_from_slice(bytes);
+        buf[15] = n as u8; // length tag in the top byte → key is never 0
+        Some(u128::from_le_bytes(buf))
+    }
+
+    /// Hot-path packer for a pretoken at `buf[start..start+len]`, `1 ≤ len ≤ 15`.
+    /// When ≥16 bytes remain it reads one unaligned `u128` and masks off the
+    /// surplus bytes — avoiding the per-token variable-length `memmove` that
+    /// `copy_from_slice` compiles to (measured ~30% of scan time). Near the
+    /// buffer end it falls back to the byte copy. Result is identical to
+    /// `pack_key(&buf[start..start+len]).unwrap()`.
+    #[inline(always)]
+    fn pack_key_at(buf: &[u8], start: usize, len: usize) -> u128 {
+        debug_assert!((1..=15).contains(&len));
+        if start + 16 <= buf.len() {
+            // SAFETY: start + 16 <= len, so 16 bytes from `start` are in bounds.
+            let raw = unsafe { (buf.as_ptr().add(start) as *const u128).read_unaligned() };
+            let keep = (1u128 << (len * 8)) - 1; // low `len` bytes (len ≤ 15 → shift ≤ 120)
+            (raw & keep) | ((len as u128) << 120)
+        } else {
+            let mut b = [0u8; 16];
+            b[..len].copy_from_slice(&buf[start..start + len]);
+            b[15] = len as u8;
+            u128::from_le_bytes(b)
+        }
+    }
+
+    #[inline(always)]
+    fn hash(key: u128) -> u64 {
+        // Fold the 128-bit key to 64 bits and mix with a single multiply. The
+        // high half (high bytes + length tag) is rotated in so short keys —
+        // whose bytes all sit in the low half — still spread across all bits.
+        let lo = key as u64;
+        let hi = (key >> 64) as u64;
+        let mut h = (lo ^ hi.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        h
+    }
+
+    /// Prefetch the cache line holding `hash`'s home slot. The fused encode
+    /// loop issues this many spans before probing, so the (near-random, often
+    /// DRAM-resident) line is resident by the time it is read.
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        let idx = hash as usize & self.mask;
+        // SAFETY: idx <= mask < cap; prefetch reads nothing, any address is ok.
+        prefetch_read(unsafe { self.slots.as_ptr().add(idx) } as *const u8);
+    }
+
+    #[inline(always)]
+    fn get(&self, key: &str, out: &mut Vec<u32>) -> bool {
+        match Self::pack_key(key.as_bytes()) {
+            Some(k) => self.get_by_key(k, Self::hash(k), out),
+            None => false,
+        }
+    }
+
+    #[inline(always)]
+    fn get_by_key(&self, k: u128, hash: u64, out: &mut Vec<u32>) -> bool {
+        let mut idx = hash as usize & self.mask;
+        loop {
+            let e = unsafe { self.slots.get_unchecked(idx) };
+            if e.key == k {
+                let len = e.len as usize;
+                if len <= PT_INLINE {
+                    out.extend_from_slice(unsafe { e.v.get_unchecked(..len) });
+                } else {
+                    let o = e.v[0] as usize;
+                    out.extend_from_slice(unsafe { self.spill.get_unchecked(o..o + len) });
+                }
+                return true;
+            }
+            if e.key == 0 {
+                return false;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    /// Branchless fast probe of the home slot: unconditionally copy that slot's
+    /// inline ids into `out`'s spare capacity, then advance the length by the
+    /// matched token count (a `cmov` — `0` when the home slot doesn't hold `k`
+    /// with an inline value). The copy is not gated on the key compare, so the
+    /// hit path has no branch-dependent load; a dead copy on a miss is simply
+    /// overwritten. Returns whether it emitted the token; a `false` (miss,
+    /// displaced key, or spilled value) falls to [`Self::get_by_key`].
+    ///
+    /// The caller must guarantee `out` has at least [`PT_INLINE`] spare slots.
+    #[inline(always)]
+    fn probe_emit_fast(&self, k: u128, hash: u64, out: &mut Vec<u32>) -> bool {
+        let idx = hash as usize & self.mask;
+        let e = unsafe { self.slots.get_unchecked(idx) };
+        let hit = e.key == k && (e.len as usize) <= PT_INLINE;
+        let w = out.len();
+        // SAFETY: caller reserved >= PT_INLINE spare, so [w, w+PT_INLINE) is in
+        // the allocation; the advance keeps len <= capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(e.v.as_ptr(), out.as_mut_ptr().add(w), PT_INLINE);
+            out.set_len(w + if hit { e.len as usize } else { 0 });
+        }
+        hit
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, key: &str, ids: &[u32]) {
+        if let Some(k) = Self::pack_key(key.as_bytes()) {
+            self.insert_by_key(k, Self::hash(k), ids);
+        }
+    }
+
+    #[inline(always)]
+    fn insert_by_key(&mut self, k: u128, hash: u64, ids: &[u32]) {
+        if (self.len + 1) * 4 > self.cap * 3 {
+            self.grow_or_clear();
+        }
+        let e = Self::build_entry(&mut self.spill, k, ids);
+        self.place_hashed(e, hash);
+    }
+
+    /// Build an entry, spilling ids past the inline capacity into `spill`.
+    #[inline(always)]
+    fn build_entry(spill: &mut Vec<u32>, k: u128, ids: &[u32]) -> PtEntry {
+        let mut e = PtEntry {
+            key: k,
+            len: ids.len() as u32,
+            v: [0; PT_INLINE],
+        };
+        if ids.len() <= PT_INLINE {
+            e.v[..ids.len()].copy_from_slice(ids);
+        } else {
+            e.v[0] = spill.len() as u32;
+            spill.extend_from_slice(ids);
+        }
+        e
+    }
+
+    /// Insert an already-built entry into its first empty slot (caller ensures
+    /// the key is absent and there is room).
+    #[inline(always)]
+    fn place(&mut self, e: PtEntry) {
+        let hash = Self::hash(e.key);
+        self.place_hashed(e, hash);
+    }
+
+    #[inline(always)]
+    fn place_hashed(&mut self, e: PtEntry, hash: u64) {
+        let mut idx = hash as usize & self.mask;
+        loop {
+            let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+            if slot.key == 0 {
+                *slot = e;
+                self.len += 1;
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[cold]
+    fn grow_or_clear(&mut self) {
+        if self.cap >= (1usize << PRETOKEN_CACHE_MAX_BITS) {
+            self.clear();
+            return;
+        }
+        let new_cap = self.cap * 2;
+        let old = std::mem::replace(&mut self.slots, vec![PtEntry::empty(); new_cap]);
+        self.cap = new_cap;
+        self.mask = new_cap - 1;
+        self.len = 0;
+        // Spill offsets are preserved across a grow (the pool is untouched).
+        for e in old {
+            if e.key != 0 {
+                self.place(e);
+            }
         }
     }
 }
 
 thread_local! {
     static TL_BPE_CACHE: RefCell<FlatCache> = RefCell::new(FlatCache::new());
-    static TL_FUSED_CACHE: RefCell<FlatCache> = RefCell::new(FlatCache::new());
+    static TL_FUSED_CACHE: RefCell<PretokenCache> = RefCell::new(PretokenCache::new());
 }
 
 const CACHE_SHARDS: usize = 64;
 
+/// Slot bits per shared-cache shard: 64 shards x 4096 slots = 256k entries.
+const SHARED_SHARD_BITS: usize = 12;
+
+/// Cross-thread token cache: [`CACHE_SHARDS`] mutex-guarded [`FlatCache`]
+/// shards. Versus the previous `HashMap<String, Vec<u32>>` shards this is
+/// allocation-free per insert (keys and ids are copied into per-shard pools
+/// that retain capacity across clears) and bounded (a shard clears at 3/4 load
+/// rather than growing forever) — removing the two heap allocations per cold
+/// pretoken and fixing unbounded growth on diverse long-running traffic.
 struct SharedCache {
-    shards: Vec<Mutex<FxHashMap<String, Vec<u32>>>>,
+    shards: Vec<Mutex<FlatCache>>,
 }
 
 impl SharedCache {
     fn new() -> Self {
         Self {
             shards: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::with_hasher(FxBuildHasher)))
+                .map(|_| Mutex::new(FlatCache::with_bits(SHARED_SHARD_BITS)))
                 .collect(),
         }
     }
 
+    /// Shard selector using the TOP bits of the same hash a [`FlatCache`] uses
+    /// (low bits) to index slots, so the two are independent.
     #[inline]
     fn shard_index(key: &str) -> usize {
-        let bytes = key.as_bytes();
-        let mut h: u64 = bytes.len() as u64;
-        for &b in &bytes[..bytes.len().min(8)] {
-            h = h.wrapping_add(b as u64).wrapping_mul(0x9E3779B97F4A7C15);
-        }
-        h as usize & (CACHE_SHARDS - 1)
+        (FlatCache::hash_str(key) >> (64 - 6)) as usize & (CACHE_SHARDS - 1)
     }
 
     #[inline]
     fn get_into(&self, key: &str, out: &mut Vec<u32>) -> bool {
-        let shard = self.shards[Self::shard_index(key)].lock().unwrap();
-        if let Some(ids) = shard.get(key) {
-            out.extend_from_slice(ids);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn insert(&self, key: String, value: Vec<u32>) {
-        self.shards[Self::shard_index(&key)]
+        self.shards[Self::shard_index(key)]
             .lock()
             .unwrap()
-            .insert(key, value);
+            .get(key, out)
+    }
+
+    #[inline]
+    fn insert(&self, key: &str, ids: &[u32]) {
+        self.shards[Self::shard_index(key)]
+            .lock()
+            .unwrap()
+            .insert(key, ids);
     }
 }
 
@@ -586,9 +891,8 @@ pub struct Bpe {
     next_prefix_map: Vec<TokenId>,
     token_lens: Vec<u16>,
     shared_cache: SharedCache,
-    fused_shared_cache: SharedCache,
     id_to_token: Vec<String>,
-    token_to_id: HashMap<String, u32>,
+    token_to_id: FxHashMap<String, u32>,
     byte_to_initial_token: [u32; 256],
     ranked_merge_map: RankedMergeMap,
     byte_pair_initial: Vec<(u32, u32)>,
@@ -690,6 +994,50 @@ fn parse_merge_entry(entry: &Value) -> Result<(&str, &str)> {
         }
         _ => Err(format!("unrecognized merge entry format: {entry:?}")),
     }
+}
+
+/// Split a token's bytes into the two lower-ranked pieces that merge to form
+/// it, using the tiktoken byte-pair-merge algorithm capped at `max_rank`.
+///
+/// `boundaries` is scratch space reused across calls. Returns the byte offset
+/// of the split point, i.e. the pieces are `bytes[..mid]` and `bytes[mid..]`.
+fn tiktoken_split(
+    byte_ranks: &HashMap<&[u8], u32>,
+    bytes: &[u8],
+    max_rank: u32,
+    boundaries: &mut Vec<usize>,
+) -> Result<usize> {
+    boundaries.clear();
+    boundaries.extend(0..=bytes.len());
+
+    // Repeatedly merge the lowest-ranked adjacent pair whose rank is below
+    // this token's own rank, exactly as tiktoken's `_byte_pair_merge` does.
+    loop {
+        let mut best_rank = u32::MAX;
+        let mut best = usize::MAX;
+        for i in 0..boundaries.len().saturating_sub(2) {
+            let pair = &bytes[boundaries[i]..boundaries[i + 2]];
+            if let Some(&rank) = byte_ranks.get(pair)
+                && rank < max_rank
+                && rank < best_rank
+            {
+                best_rank = rank;
+                best = i;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        boundaries.remove(best + 1);
+    }
+
+    if boundaries.len() != 3 {
+        return Err(format!(
+            "tiktoken token did not decompose into 2 pieces (got {}): {bytes:?}",
+            boundaries.len() - 1
+        ));
+    }
+    Ok(boundaries[1])
 }
 
 impl Bpe {
@@ -800,15 +1148,69 @@ impl Bpe {
             next_prefix_map,
             token_lens,
             shared_cache: SharedCache::new(),
-            fused_shared_cache: SharedCache::new(),
             id_to_token,
-            token_to_id: vocab.clone(),
+            token_to_id: {
+                let mut m = HashMap::with_capacity_and_hasher(vocab.len(), FxBuildHasher);
+                m.extend(vocab.iter().map(|(k, v)| (k.clone(), *v)));
+                m
+            },
             byte_to_initial_token,
             ranked_merge_map,
             byte_pair_initial,
             merge_adj,
             ignore_merges: false,
         })
+    }
+
+    /// Build a [`Bpe`] from tiktoken mergeable ranks (`token_bytes -> rank`).
+    ///
+    /// The ranks are converted into the byte-level BPE representation used
+    /// internally: each token's bytes are mapped through the GPT-2
+    /// byte-to-unicode table to form the vocab key, and the merge list is
+    /// regenerated from the ranks (splitting each multi-byte token into the two
+    /// lower-ranked pieces that form it, exactly as tiktoken does). The rank
+    /// serves as both the token id and the merge priority.
+    pub fn from_tiktoken_ranks(ranks: &[(Vec<u8>, u32)]) -> Result<Self> {
+        if ranks.is_empty() {
+            return Err("cannot build Bpe from empty tiktoken ranks".into());
+        }
+
+        // Fast raw-byte-sequence -> rank lookup for merge generation.
+        let mut byte_ranks: HashMap<&[u8], u32> = HashMap::with_capacity(ranks.len());
+        for (bytes, rank) in ranks {
+            byte_ranks.insert(bytes.as_slice(), *rank);
+        }
+
+        // Byte-level vocab: map each token's bytes through the GPT-2 table so
+        // the representation matches HuggingFace byte-level BPE tokenizers.
+        let mut vocab: Vocab = HashMap::with_capacity(ranks.len());
+        for (bytes, rank) in ranks {
+            let mut key = String::with_capacity(bytes.len());
+            for &b in bytes {
+                key.push(BYTE_TO_CHAR[b as usize]);
+            }
+            vocab.insert(key, *rank);
+        }
+
+        // Regenerate the merge list from the ranks.
+        let mut merge_map = ParsedMergeMap::with_capacity(ranks.len());
+        let mut boundaries: Vec<usize> = Vec::new();
+        for (bytes, rank) in ranks {
+            if bytes.len() < 2 {
+                continue;
+            }
+            let mid = tiktoken_split(&byte_ranks, bytes, *rank, &mut boundaries)?;
+            let (left, right) = bytes.split_at(mid);
+            let (Some(&left_id), Some(&right_id)) = (byte_ranks.get(left), byte_ranks.get(right))
+            else {
+                return Err(format!(
+                    "tiktoken token {bytes:?} split into pieces not present in the vocabulary"
+                ));
+            };
+            merge_map.insert((left_id, right_id), (*rank, *rank));
+        }
+
+        Self::new(&vocab, merge_map)
     }
 
     pub fn is_compatible_token_pair(&self, mut t1: TokenId, mut t2: TokenId) -> bool {
@@ -908,7 +1310,7 @@ impl Bpe {
             }
             c.insert(input, ids);
         });
-        self.shared_cache.insert(input.to_string(), ids.to_vec());
+        self.shared_cache.insert(input, ids);
 
         Ok(())
     }
@@ -955,12 +1357,152 @@ impl Bpe {
         })
     }
 
-    /// Priority-queue BPE merge on raw (pre-ByteLevel) bytes.
+    /// Linear-scan BPE merge for short pretokens (`n <= SMALL_MERGE_MAX`
+    /// initial symbols). Avoids the `BinaryHeap` entirely: a stack-resident
+    /// doubly-linked list plus a per-position rank array, find-min by a short
+    /// scan over stack `u32`s, merge (O(1) pointer update), then refresh only
+    /// the two neighbor pairs. At these sizes this beats the heap's
+    /// sift/stale-entry traffic and does zero heap allocation.
+    ///
+    /// Produces the identical token sequence as [`Self::run_merge_loop`]: both
+    /// process the globally lowest-`(rank, pos)` active pair each step (the
+    /// heap's `MergeEntry` key is `(rank << 32) | pos`; the scan's strict `<`
+    /// keeps the leftmost/lowest-`pos` position on ties). Enforced by the
+    /// `merge_small_matches_heap` differential test. `ids[..n]` are the
+    /// per-byte initial token ids.
+    fn merge_small_raw(
+        &self,
+        bytes: &[u8],
+        ids: &mut [u32; SMALL_MERGE_MAX],
+        n: usize,
+        out: &mut Vec<u32>,
+    ) {
+        let mut next = [0u8; SMALL_MERGE_MAX];
+        let mut prev = [0u8; SMALL_MERGE_MAX];
+        let mut ranks = [u32::MAX; SMALL_MERGE_MAX];
+        let mut new_ids = [0u32; SMALL_MERGE_MAX];
+        for i in 0..n {
+            next[i] = (i + 1) as u8;
+            prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
+        }
+        // Round-1 ranks via the dense byte-pair table: one direct-indexed load
+        // per pair instead of a CSR neighbor scan.
+        for i in 0..n - 1 {
+            let (rank, new_id) =
+                self.byte_pair_initial[bytes[i] as usize * 256 + bytes[i + 1] as usize];
+            if rank != u32::MAX {
+                ranks[i] = rank;
+                new_ids[i] = new_id;
+            }
+        }
+        loop {
+            let mut best = u32::MAX;
+            let mut best_i = 0usize;
+            for (i, &rank) in ranks[..n - 1].iter().enumerate() {
+                if rank < best {
+                    best = rank;
+                    best_i = i;
+                }
+            }
+            if best == u32::MAX {
+                break;
+            }
+            let i = best_i;
+            ids[i] = new_ids[i];
+            let dead = next[i] as usize;
+            let new_right = next[dead] as usize;
+            next[i] = new_right as u8;
+            ranks[dead] = u32::MAX;
+            if new_right < n {
+                prev[new_right] = i as u8;
+                match self.merge_adj.get(ids[i], ids[new_right]) {
+                    Some((rank, new_id)) => {
+                        ranks[i] = rank;
+                        new_ids[i] = new_id;
+                    }
+                    None => ranks[i] = u32::MAX,
+                }
+            } else {
+                ranks[i] = u32::MAX;
+            }
+            let left = prev[i] as usize;
+            if left < n {
+                match self.merge_adj.get(ids[left], ids[i]) {
+                    Some((rank, new_id)) => {
+                        ranks[left] = rank;
+                        new_ids[left] = new_id;
+                    }
+                    None => ranks[left] = u32::MAX,
+                }
+            }
+        }
+        let mut i = 0usize;
+        while i < n {
+            out.push(ids[i]);
+            i = next[i] as usize;
+        }
+    }
+
+    /// `ignore_merges` whole-pretoken lookup: is the ByteLevel-encoded form of
+    /// the entire pretoken a single vocab token? Encodes into a stack buffer
+    /// for short pretokens (`BYTE_TO_CHAR` codepoints are <= U+0143, so <= 2
+    /// UTF-8 bytes per input byte) instead of allocating a `String` per cold
+    /// pretoken; falls back to a heap `String` only for long ones.
+    #[inline]
+    fn whole_pretoken_id(&self, raw: &str) -> Option<u32> {
+        const STACK: usize = 128;
+        let bytes = raw.as_bytes();
+        if bytes.len() * 2 <= STACK {
+            let mut buf = [0u8; STACK];
+            let mut n = 0;
+            for &b in bytes {
+                n += BYTE_TO_CHAR[b as usize].encode_utf8(&mut buf[n..]).len();
+            }
+            // SAFETY: buf[..n] is a concatenation of `char::encode_utf8`
+            // outputs, hence valid UTF-8.
+            let encoded = unsafe { std::str::from_utf8_unchecked(&buf[..n]) };
+            self.token_to_id.get(encoded).copied()
+        } else {
+            let mut encoded = String::with_capacity(bytes.len() * 2);
+            for &b in bytes {
+                encoded.push(BYTE_TO_CHAR[b as usize]);
+            }
+            self.token_to_id.get(encoded.as_str()).copied()
+        }
+    }
+
+    /// BPE merge on raw (pre-ByteLevel) bytes. Short pretokens (the common
+    /// case) use the stack-resident linear scan; longer ones use the heap.
     fn merge_all_raw_into(&self, raw_input: &str, out: &mut Vec<u32>) -> Result<()> {
         if raw_input.is_empty() {
             return Ok(());
         }
 
+        let bytes = raw_input.as_bytes();
+        if bytes.len() <= SMALL_MERGE_MAX {
+            let n = bytes.len();
+            let mut ids = [0u32; SMALL_MERGE_MAX];
+            for (i, &byte) in bytes.iter().enumerate() {
+                let id = self.byte_to_initial_token[byte as usize];
+                if id == INVALID_TOKEN {
+                    return Err(format!("byte 0x{byte:02x} has no token in vocabulary"));
+                }
+                ids[i] = id;
+            }
+            if n == 1 {
+                out.push(ids[0]);
+            } else {
+                self.merge_small_raw(bytes, &mut ids, n, out);
+            }
+            return Ok(());
+        }
+
+        self.merge_all_raw_heap_into(raw_input, out)
+    }
+
+    /// Reference priority-queue BPE merge on raw (pre-ByteLevel) bytes, used for
+    /// long pretokens and as the correctness oracle for [`Self::merge_small_raw`].
+    fn merge_all_raw_heap_into(&self, raw_input: &str, out: &mut Vec<u32>) -> Result<()> {
         TL_MERGE_SCRATCH.with(|s| {
             let mut scratch = s.borrow_mut();
             scratch.symbols.clear();
@@ -1112,30 +1654,13 @@ impl Bpe {
         }
 
         let start = out.len();
-        if self.fused_shared_cache.get_into(raw_input, out) {
-            TL_FUSED_CACHE.with(|c| {
-                let mut c = c.borrow_mut();
-                if c.bpe_id != bpe_id {
-                    c.bpe_id = bpe_id;
-                    c.clear();
-                }
-                c.insert(raw_input, &out[start..]);
-            });
-            return Ok(());
+        if self.ignore_merges
+            && let Some(id) = self.whole_pretoken_id(raw_input)
+        {
+            out.push(id);
+        } else {
+            self.merge_all_raw_into(raw_input, out)?;
         }
-
-        if self.ignore_merges {
-            let mut encoded = String::with_capacity(raw_input.len());
-            for &byte in raw_input.as_bytes() {
-                encoded.push(BYTE_TO_CHAR[byte as usize]);
-            }
-            if let Some(&id) = self.token_to_id.get(encoded.as_str()) {
-                out.push(id);
-                return Ok(());
-            }
-        }
-
-        self.merge_all_raw_into(raw_input, out)?;
 
         let ids = &out[start..];
         TL_FUSED_CACHE.with(|c| {
@@ -1146,9 +1671,63 @@ impl Bpe {
             }
             c.insert(raw_input, ids);
         });
-        self.fused_shared_cache
-            .insert(raw_input.to_string(), ids.to_vec());
 
+        Ok(())
+    }
+
+    /// Fused tokenization of one already-sliced raw-text piece, consulting and
+    /// populating the given thread-local cache plus the shared cache. Shared by
+    /// the split-based and range-based batch entry points.
+    #[inline]
+    fn fused_one(&self, text: &str, cache: &mut PretokenCache, out: &mut Vec<u32>) -> Result<()> {
+        if cache.get(text, out) {
+            return Ok(());
+        }
+
+        let start = out.len();
+        if self.ignore_merges
+            && let Some(id) = self.whole_pretoken_id(text)
+        {
+            out.push(id);
+        } else {
+            self.merge_all_raw_into(text, out)?;
+        }
+        cache.insert(text, &out[start..]);
+        Ok(())
+    }
+
+    /// Encode one already-harvested pretoken span using a precomputed cache key
+    /// and hash (`key == 0` means the span is not inline-cacheable). Its cache
+    /// line was prefetched `PREFETCH_DISTANCE` spans earlier by the driver.
+    #[inline(always)]
+    fn process_span(
+        &self,
+        cache: &mut PretokenCache,
+        text: &str,
+        key: u128,
+        hash: u64,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        if key != 0 {
+            out.reserve(PT_INLINE);
+            if cache.probe_emit_fast(key, hash, out) {
+                return Ok(());
+            }
+            if cache.get_by_key(key, hash, out) {
+                return Ok(());
+            }
+        }
+        let start = out.len();
+        if self.ignore_merges
+            && let Some(id) = self.whole_pretoken_id(text)
+        {
+            out.push(id);
+        } else {
+            self.merge_all_raw_into(text, out)?;
+        }
+        if key != 0 {
+            cache.insert_by_key(key, hash, &out[start..]);
+        }
         Ok(())
     }
 
@@ -1171,41 +1750,144 @@ impl Bpe {
                     out.push(id);
                 } else if !split.range.is_empty() {
                     let text = &buffer[split.range.clone()];
-                    if text.is_empty() {
-                        continue;
+                    if !text.is_empty() {
+                        self.fused_one(text, &mut cache, out)?;
                     }
-
-                    if cache.get(text, out) {
-                        continue;
-                    }
-
-                    let start = out.len();
-                    if self.fused_shared_cache.get_into(text, out) {
-                        cache.insert(text, &out[start..]);
-                        continue;
-                    }
-
-                    if self.ignore_merges {
-                        let mut encoded = String::with_capacity(text.len());
-                        for &byte in text.as_bytes() {
-                            encoded.push(BYTE_TO_CHAR[byte as usize]);
-                        }
-                        if let Some(&id) = self.token_to_id.get(encoded.as_str()) {
-                            out.push(id);
-                            cache.insert(text, &out[start..]);
-                            continue;
-                        }
-                    }
-
-                    self.merge_all_raw_into(text, out)?;
-
-                    cache.insert(text, &out[start..]);
-                    let key = text.to_string();
-                    let val = out[start..].to_vec();
-                    self.fused_shared_cache.insert(key, val);
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Like [`Self::tokenize_batch_fused`] but over pre-computed `(start, end)`
+    /// byte ranges (all text; no pre-assigned token IDs), as produced by the
+    /// scanner fast path.
+    /// Fused scan+BPE of one segment under a single thread-local cache borrow.
+    ///
+    /// Drives [`scan_core`](crate::pre_tokenizers::scan::scan_core) as a
+    /// software pipeline: the scan harvests each pretoken's cache key/hash and
+    /// prefetches its cache line, but the actual probe+encode of that span is
+    /// deferred [`PREFETCH_DISTANCE`] spans (held in a small ring), by which
+    /// time the (often DRAM-resident) line has arrived. This hides the pretoken
+    /// cache's memory latency, which dominates the fused loop on long-tail text.
+    pub fn tokenize_scanned_segment(
+        &self,
+        kind: crate::pre_tokenizers::scan::ScanKind,
+        seg: &str,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        /// Spans of prefetch-ahead. Enough to cover DRAM latency; the ring is
+        /// tiny so it stays in registers/L1.
+        const PREFETCH_DISTANCE: usize = 16;
+
+        #[derive(Clone, Copy, Default)]
+        struct Pending {
+            start: u32,
+            end: u32,
+            key: u128,
+            hash: u64,
+        }
+
+        let bpe_id = self.id;
+        let sb = seg.as_bytes();
+        TL_FUSED_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.bpe_id != bpe_id {
+                cache.bpe_id = bpe_id;
+                cache.clear();
+            }
+
+            let mut ring = [Pending::default(); PREFETCH_DISTANCE];
+            let mut n: usize = 0; // spans harvested so far
+
+            crate::pre_tokenizers::scan::scan_core(kind, seg, |start, end| {
+                if start == end {
+                    return Ok(());
+                }
+                // Harvest: pack the key, prefetch its line, park the span.
+                let len = end - start;
+                let (key, hash) = if (1..=15).contains(&len) {
+                    let k = PretokenCache::pack_key_at(sb, start, len);
+                    let h = PretokenCache::hash(k);
+                    cache.prefetch(h);
+                    (k, h)
+                } else {
+                    (0u128, 0u64)
+                };
+                // The span `n - PREFETCH_DISTANCE` (living in this ring slot,
+                // prefetched that many spans ago) is now due — encode it before
+                // its slot is overwritten.
+                if n >= PREFETCH_DISTANCE {
+                    let p = ring[n % PREFETCH_DISTANCE];
+                    self.process_span(
+                        &mut cache,
+                        &seg[p.start as usize..p.end as usize],
+                        p.key,
+                        p.hash,
+                        out,
+                    )?;
+                }
+                ring[n % PREFETCH_DISTANCE] = Pending {
+                    start: start as u32,
+                    end: end as u32,
+                    key,
+                    hash,
+                };
+                n += 1;
+                Ok(())
+            })?;
+
+            // Drain the last (up to) PREFETCH_DISTANCE parked spans, in order.
+            let first = n.saturating_sub(PREFETCH_DISTANCE);
+            for i in first..n {
+                let p = ring[i % PREFETCH_DISTANCE];
+                self.process_span(
+                    &mut cache,
+                    &seg[p.start as usize..p.end as usize],
+                    p.key,
+                    p.hash,
+                    out,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Like [`tokenize_scanned_segment`], but also appends fine-grained reuse
+    /// boundaries to `bounds`: for every pretoken that begins at a hard boundary
+    /// (preceded by a `\r`/`\n`, followed by an ASCII non-whitespace byte), the
+    /// `(local_byte_offset, local_token_index)` at that point — i.e.
+    /// `out[..token_index]` is exactly the encoding of `seg[..byte_offset]`.
+    /// Used only by the prefix cache's (cold) miss path, so the extra per-
+    /// pretoken check stays out of the hot [`tokenize_scanned_segment`].
+    pub fn tokenize_scanned_segment_rec(
+        &self,
+        kind: crate::pre_tokenizers::scan::ScanKind,
+        seg: &str,
+        out: &mut Vec<u32>,
+        bounds: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        let bpe_id = self.id;
+        let b = seg.as_bytes();
+        TL_FUSED_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.bpe_id != bpe_id {
+                cache.bpe_id = bpe_id;
+                cache.clear();
+            }
+            crate::pre_tokenizers::scan::scan_core(kind, seg, |start, end| {
+                if start > 0
+                    && (b[start - 1] == b'\n' || b[start - 1] == b'\r')
+                    && b[start] < 0x80
+                    && !b[start].is_ascii_whitespace()
+                {
+                    bounds.push((start as u32, out.len() as u32));
+                }
+                if start != end {
+                    self.fused_one(&seg[start..end], &mut cache, out)?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -1232,7 +1914,6 @@ impl Clone for Bpe {
             next_prefix_map: self.next_prefix_map.clone(),
             token_lens: self.token_lens.clone(),
             shared_cache: SharedCache::new(),
-            fused_shared_cache: SharedCache::new(),
             id_to_token: self.id_to_token.clone(),
             token_to_id: self.token_to_id.clone(),
             byte_to_initial_token: self.byte_to_initial_token,
@@ -1329,6 +2010,31 @@ mod tests {
     fn repeated_merge() {
         let bpe = test_bpe();
         assert_eq!(bpe.tokenize("abab").unwrap(), vec![4, 4]);
+    }
+
+    #[test]
+    fn merge_small_matches_heap() {
+        let bpe = test_bpe();
+        let alphabet = [b'a', b'b', b'c', b'd'];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+
+        for len in 1..=SMALL_MERGE_MAX {
+            for _ in 0..512 {
+                let mut bytes = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    bytes.push(alphabet[state as usize & 3]);
+                }
+                let input = std::str::from_utf8(&bytes).unwrap();
+                let mut small = Vec::new();
+                let mut heap = Vec::new();
+                bpe.merge_all_raw_into(input, &mut small).unwrap();
+                bpe.merge_all_raw_heap_into(input, &mut heap).unwrap();
+                assert_eq!(small, heap, "short merge mismatch for {input:?}");
+            }
+        }
     }
 
     #[test]

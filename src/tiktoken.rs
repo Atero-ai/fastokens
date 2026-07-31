@@ -1,0 +1,332 @@
+//! Support for the `tiktoken` model format (OpenAI's `.tiktoken` / `tiktoken.model`
+//! files, e.g. `cl100k_base`, `o200k_base`, or the `tiktoken.model` shipped by
+//! models such as Kimi-K2).
+//!
+//! A tiktoken model file is a list of `base64(token_bytes) rank` lines, e.g.
+//!
+//! ```text
+//! IQ== 0
+//! Ig== 1
+//! ...
+//! ```
+//!
+//! This file carries **only** the mergeable ranks (a byte-level BPE vocabulary
+//! where the rank doubles as both the token id and the merge priority). It does
+//! *not* contain the pre-tokenization regex (`pat_str`) or the special tokens —
+//! those live in companion code (tiktoken's registry, `tokenization_*.py`, …),
+//! so they must be supplied separately via [`TiktokenConfig`].
+//!
+//! The ranks are converted into the same internal representation used for
+//! HuggingFace byte-level BPE tokenizers: each token's bytes are mapped through
+//! the GPT-2 byte-to-unicode table and the merge list is regenerated from the
+//! ranks. The resulting [`Tokenizer`](crate::Tokenizer) runs on the existing
+//! fused byte-level BPE path.
+
+use crate::Error;
+
+/// The pre-tokenization regex used by OpenAI's `cl100k_base` encoding
+/// (GPT-3.5 / GPT-4).
+///
+/// This is the canonical (non-possessive) form, which is equivalent to the
+/// pattern tiktoken ships but compiles on the regex engines used internally.
+pub const CL100K_BASE_PATTERN: &str = concat!(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+    r"|\p{N}{1,3}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
+/// The pre-tokenization regex used by OpenAI's `o200k_base` encoding
+/// (GPT-4o and later).
+pub const O200K_BASE_PATTERN: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"|\p{N}{1,3}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
+/// Everything needed to turn a set of mergeable ranks into a working
+/// tokenizer: the pre-tokenization regex and the special tokens.
+///
+/// Use [`TiktokenConfig::cl100k_base`] / [`TiktokenConfig::o200k_base`] for the
+/// standard OpenAI encodings, or [`TiktokenConfig::new`] to supply a custom
+/// pattern and special-token table (e.g. when loading a model's own
+/// `tiktoken.model`).
+#[derive(Clone, Debug)]
+pub struct TiktokenConfig {
+    /// The pre-tokenization regex (`pat_str`). Applied with `Isolated`
+    /// behavior, matching tiktoken's `regex.findall` over the input.
+    pub pattern: String,
+    /// Special tokens as `(content, id)` pairs. These are matched literally
+    /// before the BPE model (like HuggingFace added tokens) and are marked
+    /// special, so they can be skipped on decode.
+    pub special_tokens: Vec<(String, u32)>,
+}
+
+impl TiktokenConfig {
+    /// Build a config from a pattern and an explicit list of special tokens.
+    pub fn new(pattern: impl Into<String>, special_tokens: Vec<(String, u32)>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            special_tokens,
+        }
+    }
+
+    /// Config for OpenAI's `cl100k_base` encoding (GPT-3.5 / GPT-4).
+    pub fn cl100k_base() -> Self {
+        Self::new(
+            CL100K_BASE_PATTERN,
+            vec![
+                ("<|endoftext|>".into(), 100257),
+                ("<|fim_prefix|>".into(), 100258),
+                ("<|fim_middle|>".into(), 100259),
+                ("<|fim_suffix|>".into(), 100260),
+                ("<|endofprompt|>".into(), 100276),
+            ],
+        )
+    }
+
+    /// Config for OpenAI's `o200k_base` encoding (GPT-4o and later).
+    pub fn o200k_base() -> Self {
+        Self::new(
+            O200K_BASE_PATTERN,
+            vec![
+                ("<|endoftext|>".into(), 199999),
+                ("<|endofprompt|>".into(), 200018),
+            ],
+        )
+    }
+
+    /// Resolve a preset config by name (`"cl100k_base"` or `"o200k_base"`).
+    pub fn from_preset(name: &str) -> Option<Self> {
+        match name {
+            "cl100k_base" | "cl100k" => Some(Self::cl100k_base()),
+            "o200k_base" | "o200k" => Some(Self::o200k_base()),
+            _ => None,
+        }
+    }
+}
+
+/// Parse the contents of a tiktoken model file into `(token_bytes, rank)`
+/// entries.
+///
+/// Each non-empty line must be `<base64> <rank>`; blank lines are ignored.
+/// This mirrors tiktoken's own `load_tiktoken_bpe`.
+pub fn parse_tiktoken_model(contents: &str) -> Result<Vec<(Vec<u8>, u32)>, Error> {
+    let mut out = Vec::new();
+    for (i, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let token_b64 = fields
+            .next()
+            .ok_or_else(|| Error::Tiktoken(format!("line {}: empty entry", i + 1)))?;
+        let rank_str = fields
+            .next()
+            .ok_or_else(|| Error::Tiktoken(format!("line {}: missing rank", i + 1)))?;
+        let bytes = base64_decode(token_b64)
+            .map_err(|e| Error::Tiktoken(format!("line {}: {e}", i + 1)))?;
+        let rank: u32 = rank_str
+            .parse()
+            .map_err(|_| Error::Tiktoken(format!("line {}: invalid rank {rank_str:?}", i + 1)))?;
+        out.push((bytes, rank));
+    }
+    if out.is_empty() {
+        return Err(Error::Tiktoken("no token entries found".into()));
+    }
+    Ok(out)
+}
+
+/// Decode a standard-alphabet base64 string (padding optional).
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    #[inline]
+    fn sextet(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = s.as_bytes();
+    // Ignore any trailing '=' padding.
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'=' {
+        end -= 1;
+    }
+
+    let mut out = Vec::with_capacity(end * 3 / 4 + 1);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in &bytes[..end] {
+        let v = sextet(c).ok_or_else(|| format!("invalid base64 character {:?}", c as char))?;
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_roundtrip() {
+        // "!" -> IQ==, "\"" -> Ig==, "#" -> Iw==
+        assert_eq!(base64_decode("IQ==").unwrap(), b"!");
+        assert_eq!(base64_decode("Ig==").unwrap(), b"\"");
+        assert_eq!(base64_decode("Iw==").unwrap(), b"#");
+        // Multi-byte with no padding.
+        assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn base64_rejects_garbage() {
+        assert!(base64_decode("not base64!!").is_err());
+    }
+
+    #[test]
+    fn parse_simple_model() {
+        let contents = "IQ== 0\nIg== 1\n\nIw== 2\n";
+        let ranks = parse_tiktoken_model(contents).unwrap();
+        assert_eq!(
+            ranks,
+            vec![(b"!".to_vec(), 0), (b"\"".to_vec(), 1), (b"#".to_vec(), 2)]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        assert!(parse_tiktoken_model("\n\n").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_missing_rank() {
+        assert!(parse_tiktoken_model("IQ==\n").is_err());
+    }
+
+    #[test]
+    fn presets_resolve() {
+        assert!(TiktokenConfig::from_preset("cl100k_base").is_some());
+        assert!(TiktokenConfig::from_preset("o200k_base").is_some());
+        assert!(TiktokenConfig::from_preset("nope").is_none());
+    }
+
+    /// End-to-end over a tiny hand-crafted byte-level BPE: exercises merge
+    /// generation, the fused Split+ByteLevel path, special-token splitting,
+    /// and ByteLevel decode round-trip — with no external fixtures.
+    #[test]
+    fn end_to_end_tiny_bpe() {
+        use crate::Tokenizer;
+
+        // Single bytes 0..=3, then merges "ab"=4 and "abc"=5 (ranks double as
+        // ids and merge priorities, just like a real tiktoken model).
+        let ranks: Vec<(Vec<u8>, u32)> = vec![
+            (b"a".to_vec(), 0),
+            (b"b".to_vec(), 1),
+            (b"c".to_vec(), 2),
+            (b" ".to_vec(), 3),
+            (b"ab".to_vec(), 4),
+            (b"abc".to_vec(), 5),
+        ];
+        let config = TiktokenConfig::new(r"\S+| +", vec![("<|end|>".to_string(), 6)]);
+        let tok = Tokenizer::from_tiktoken_ranks(&ranks, config).unwrap();
+
+        // Greedy lowest-rank merges: "abc" -> [abc], "ab" -> [ab], repeats.
+        assert_eq!(tok.encode("abc").unwrap(), vec![5]);
+        assert_eq!(tok.encode("ab").unwrap(), vec![4]);
+        assert_eq!(tok.encode("abab").unwrap(), vec![4, 4]);
+        // Pre-tokenizer isolates the whitespace run into its own piece.
+        assert_eq!(tok.encode("ab c").unwrap(), vec![4, 3, 2]);
+
+        // Special token is split out and emitted directly.
+        let ids = tok.encode("ab<|end|>c").unwrap();
+        assert_eq!(ids, vec![4, 6, 2]);
+        assert_eq!(tok.token_to_id("<|end|>"), Some(6));
+        assert_eq!(tok.id_to_token(6), Some("<|end|>"));
+        assert!(tok.is_special_token(6));
+
+        // Decode round-trips; skip_special_tokens drops the special.
+        assert_eq!(tok.decode(&ids, false).unwrap(), "ab<|end|>c");
+        assert_eq!(tok.decode(&ids, true).unwrap(), "abc");
+    }
+
+    /// The opt-in prefix cache returns results bit-identical to the uncached
+    /// path — for exact repeats, for inputs sharing a byte prefix with a cached
+    /// one (the shared-system-prompt case), and across an LRU of prefixes —
+    /// exercising both the miss (store) and hit (reuse) paths on the scanner.
+    #[test]
+    fn prefix_cache_matches_uncached() {
+        use crate::Tokenizer;
+
+        // A byte-level vocab (all 256 single bytes) under the o200k pattern, so
+        // the scanner fast path — where the prefix cache lives — engages.
+        let ranks: Vec<(Vec<u8>, u32)> = (0..256u32).map(|i| (vec![i as u8], i)).collect();
+        let cfg = TiktokenConfig::new(O200K_BASE_PATTERN, vec![]);
+
+        // Two distinct shared prefixes, each well over the 8 KiB / 256-token
+        // reuse thresholds, with lines that begin at hard boundaries.
+        let pa = "the quick brown fox jumps over the lazy dog 12 times\n".repeat(250);
+        let pb = "SECTION header: values (a, b, c) and 1, 2, 3 -- see notes.\n".repeat(250);
+        let tails = [
+            "",
+            "x",
+            " trailing",
+            "\n\n  \nmore text here\n",
+            "!!!weird***",
+            "\t\tindented line\n",
+            "'contraction test's fine",
+        ];
+
+        // Reference encodings computed with the cache OFF.
+        let tok = Tokenizer::from_tiktoken_ranks(&ranks, cfg.clone()).unwrap();
+        let mut inputs = Vec::new();
+        for p in [&pa, &pb] {
+            for t in tails {
+                inputs.push(format!("{p}{t}"));
+            }
+        }
+        let expected: Vec<Vec<u32>> = inputs.iter().map(|s| tok.encode(s).unwrap()).collect();
+
+        // With the cache ON, every input must match — first pass primes the
+        // cache (misses), second pass reuses the shared prefixes (hits).
+        let mut cached = Tokenizer::from_tiktoken_ranks(&ranks, cfg).unwrap();
+        cached.enable_input_cache(4);
+        for _ in 0..2 {
+            for (s, exp) in inputs.iter().zip(&expected) {
+                assert_eq!(&cached.encode(s).unwrap(), exp);
+            }
+        }
+    }
+
+    /// The `from_tiktoken_str` path parses the base64 model format and builds a
+    /// working tokenizer (bytes with non-ASCII values round-trip too).
+    #[test]
+    fn from_str_roundtrip_with_space_byte() {
+        use crate::Tokenizer;
+
+        // "YQ==" = "a", "IA==" = " ", "YSA=" = "a " (merge).
+        let contents = "YQ== 0\nIA== 1\nYSA= 2\n";
+        let config = TiktokenConfig::new(r"\S+| +|\S", vec![]);
+        let tok = Tokenizer::from_tiktoken_str(contents, config).unwrap();
+        // The space byte is stored byte-level ("Ġ") yet decodes back to " ".
+        assert_eq!(tok.decode(&[1], false).unwrap(), " ");
+        assert_eq!(tok.encode("a").unwrap(), vec![0]);
+    }
+}

@@ -22,9 +22,9 @@ fn main() -> Result<()> {
             .get(3)
             .and_then(|s| s.parse().ok())
             .unwrap_or(data.len());
-        for i in start..end.min(data.len()) {
-            if let Some(ctx) = data[i].get("context").and_then(|v| v.as_str()) {
-                println!("[{:>3}] {} chars", i, ctx.len());
+        for (offset, item) in data[start..end.min(data.len())].iter().enumerate() {
+            if let Some(ctx) = item.get("context").and_then(|v| v.as_str()) {
+                println!("[{:>3}] {} chars", start + offset, ctx.len());
             }
         }
         return Ok(());
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     // Step 1: Pre-tokenize only
     let t0 = Instant::now();
     let mut pts = tokenizer.build_pre_tokenized(input);
-    if let Some(ref pt) = tokenizer.pre_tokenizer() {
+    if let Some(pt) = tokenizer.pre_tokenizer() {
         pt.pre_tokenize(&mut pts)?;
     }
     let pre_tok_time = t0.elapsed();

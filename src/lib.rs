@@ -6,8 +6,14 @@ pub mod normalizers;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
+pub mod tiktoken;
 
-use std::{fs, path::Path};
+use std::{
+    collections::VecDeque,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use rayon::prelude::*;
 use serde_json::Value;
@@ -23,6 +29,7 @@ pub use self::{
     normalizers::{Nfc, Normalizer},
     post_processors::PostProcessor,
     pre_tokenizers::{ByteLevel, PreTokenizer, Split, SplitBehavior},
+    tiktoken::{CL100K_BASE_PATTERN, O200K_BASE_PATTERN, TiktokenConfig},
 };
 
 use self::{
@@ -110,8 +117,172 @@ pub enum Error {
     #[error("model error: {0}")]
     Model(String),
 
+    #[error("invalid tiktoken model: {0}")]
+    Tiktoken(String),
+
     #[error("invalid model identifier: {0}")]
     InvalidIdentifier(String),
+}
+
+/// Don't attempt prefix reuse unless the shared prefix is at least this many
+/// bytes — below it, tokenizing from scratch is already cheap and the LCP scan
+/// plus bookkeeping isn't worth it.
+const PREFIX_CACHE_MIN_LCP: usize = 8 * 1024;
+/// Don't reuse a cached prefix unless it covers at least this many tokens — the
+/// win has to beat the fixed cost of the id copy.
+const PREFIX_CACHE_MIN_REUSE_TOKENS: usize = 256;
+
+/// One cached full encoding, retained so a later input that shares a byte prefix
+/// with it can reuse the leading token ids instead of re-tokenizing them.
+struct PrefixEntry {
+    /// The (normalized) buffer that produced `core_ids`.
+    buf: Box<[u8]>,
+    /// Core token ids for `buf` — before post-processing (special tokens).
+    core_ids: Arc<[u32]>,
+    /// Ascending `(byte_offset, token_index)` at each newline-chunk boundary:
+    /// `core_ids[..token_index]` is exactly the encoding of `buf[..byte_offset]`.
+    /// Reuse is only ever cut at one of these offsets.
+    bounds: Box<[(u32, u32)]>,
+}
+
+/// A reuse decision produced under the lock and applied without it.
+struct Reuse {
+    core_ids: Arc<[u32]>,
+    /// Number of leading tokens to reuse.
+    tokens: usize,
+    /// Byte offset in the input from which the tail must be tokenized.
+    tail_start: usize,
+}
+
+/// Bounded, opt-in **prefix cache** for the scanner fast path. It keeps a small
+/// LRU of recent full encodings; when a new input shares a byte prefix with a
+/// cached one, the leading token ids are copied straight from the cache (cut at
+/// a hard pretoken boundary) and only the differing tail is tokenized.
+///
+/// This is the mechanism for **shared system prompts / long shared contexts**:
+/// the shared prefix is tokenized once, then every later request that begins
+/// with it pays only for its own tail. An exact repeat reuses the whole
+/// encoding.
+///
+/// It is **off by default** ([`Tokenizer::enable_input_cache`] or the
+/// `FASTOKENS_INPUT_CACHE=<capacity>` env var) because each call then does an
+/// LCP scan against the cached buffers — a win only when inputs actually share
+/// prefixes, and overhead on wholly-unique traffic. Reuse cuts are only ever
+/// made at offsets whose following byte is ASCII non-whitespace, which is an
+/// unconditional pretoken boundary, so a reused prefix can never depend on the
+/// (differing) tail — the result is bit-identical to tokenizing from scratch.
+struct InputCache {
+    capacity: usize,
+    /// Most-recent-first LRU of cached encodings.
+    entries: VecDeque<PrefixEntry>,
+}
+
+/// Longest common byte prefix of `a` and `b`, compared 8 bytes at a time.
+#[inline]
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
+        if x != y {
+            break;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// A byte after which a pretoken boundary is *unconditional* — an ASCII
+/// non-whitespace byte. If `buf[p]` is such a byte and `buf[p-1]` ended a
+/// newline run, `p` is a hard boundary no matter what precedes or follows.
+#[inline]
+fn is_hard_reuse_byte(b: u8) -> bool {
+    b < 0x80 && !b.is_ascii_whitespace()
+}
+
+impl InputCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Decide how much of `input`'s encoding can be reused from a cached entry.
+    /// Returns `None` when nothing worthwhile is shared.
+    fn reuse_plan(&self, input: &[u8]) -> Option<Reuse> {
+        // Pick the cached entry sharing the longest byte prefix with `input`.
+        let mut best: Option<(usize, usize)> = None; // (entry index, prefix len)
+        for (i, e) in self.entries.iter().enumerate() {
+            let l = common_prefix_len(&e.buf, input);
+            if best.is_none_or(|(_, bl)| l > bl) {
+                best = Some((i, l));
+            }
+        }
+        let (idx, l) = best?;
+        let e = &self.entries[idx];
+
+        // Exact repeat: reuse the whole encoding.
+        if l == input.len() && l == e.buf.len() {
+            return Some(Reuse {
+                core_ids: e.core_ids.clone(),
+                tokens: e.core_ids.len(),
+                tail_start: input.len(),
+            });
+        }
+        if l < PREFIX_CACHE_MIN_LCP {
+            return None;
+        }
+
+        // Largest recorded boundary strictly inside the shared prefix whose
+        // following byte makes it an unconditional pretoken boundary. `p < l`
+        // guarantees `input[p] == e.buf[p]`, so the check holds for `input` too.
+        let mut chosen: Option<(usize, usize)> = None;
+        for &(bo, tk) in e.bounds.iter() {
+            let p = bo as usize;
+            if p >= l {
+                break;
+            }
+            if is_hard_reuse_byte(e.buf[p]) {
+                chosen = Some((p, tk as usize));
+            }
+        }
+        let (p, tokens) = chosen?;
+        if tokens < PREFIX_CACHE_MIN_REUSE_TOKENS {
+            return None;
+        }
+        Some(Reuse {
+            core_ids: e.core_ids.clone(),
+            tokens,
+            tail_start: p,
+        })
+    }
+
+    /// Store a freshly computed full encoding (LRU-evicting the oldest entry).
+    fn insert(&mut self, buf: &[u8], core_ids: &[u32], bounds: Vec<(u32, u32)>) {
+        if self.entries.len() >= self.capacity {
+            self.entries.pop_back();
+        }
+        self.entries.push_front(PrefixEntry {
+            buf: buf.into(),
+            core_ids: core_ids.into(),
+            bounds: bounds.into_boxed_slice(),
+        });
+    }
+}
+
+/// Build an [`InputCache`] from the `FASTOKENS_INPUT_CACHE` env var (a capacity),
+/// or `None` if unset — the default.
+fn input_cache_from_env() -> Option<Mutex<InputCache>> {
+    std::env::var("FASTOKENS_INPUT_CACHE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&c| c >= 1)
+        .map(|c| Mutex::new(InputCache::new(c)))
 }
 
 /// An LLM tokenizer backed by `tokenizer.json`.
@@ -125,6 +296,8 @@ pub struct Tokenizer {
     /// When the pre-tokenizer is `Sequence([Split, ByteLevel(bulk)])`,
     /// we store a Split-only pre-tokenizer and fuse ByteLevel into BPE.
     split_only: Option<PreTokenizer>,
+    /// Optional whole-input encoding cache; `None` (off) unless enabled.
+    input_cache: Option<Mutex<InputCache>>,
 }
 
 impl Tokenizer {
@@ -154,6 +327,7 @@ impl Tokenizer {
             post_processor,
             decoder,
             split_only,
+            input_cache: input_cache_from_env(),
         })
     }
 
@@ -185,6 +359,79 @@ impl Tokenizer {
     pub fn from_file(path: &Path) -> Result<Self, Error> {
         let json: TokenizerJson = serde_json::from_str(&fs::read_to_string(path)?)?;
         Self::build(json)
+    }
+
+    /// Create a tokenizer from tiktoken mergeable ranks (`token_bytes -> rank`).
+    ///
+    /// A tiktoken model carries only the byte-level BPE ranks; the
+    /// pre-tokenization regex and special tokens are supplied via `config`
+    /// (see [`TiktokenConfig`]). The resulting pipeline is: split special
+    /// tokens → split on the regex → fused byte-level BPE → ByteLevel decode.
+    pub fn from_tiktoken_ranks(
+        ranks: &[(Vec<u8>, u32)],
+        config: TiktokenConfig,
+    ) -> Result<Self, Error> {
+        let bpe = models::bpe::Bpe::from_tiktoken_ranks(ranks).map_err(Error::Model)?;
+        let model = Model::Bpe(bpe);
+
+        // Sequence([Split(pat_str, Isolated), ByteLevel(bulk)]) — the shape the
+        // fused byte-level path is detected from. The Split reproduces
+        // tiktoken's `regex.findall`; ByteLevel(bulk) marks byte-level BPE.
+        let split = Split::from_config(
+            &serde_json::json!({ "Regex": config.pattern }),
+            "Isolated",
+            false,
+        )?;
+        let byte_level = ByteLevel::from_config(false, false, false)?;
+        let pre_tokenizer = Some(PreTokenizer::Sequence(vec![
+            PreTokenizer::Split(split),
+            PreTokenizer::ByteLevel(byte_level),
+        ]));
+        let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
+
+        // Special tokens become literal (unnormalized) added tokens, matched
+        // before the model and marked special so decode can skip them.
+        let added_configs: Vec<AddedTokenConfig> = config
+            .special_tokens
+            .into_iter()
+            .map(|(content, id)| AddedTokenConfig {
+                id,
+                content,
+                single_word: false,
+                lstrip: false,
+                rstrip: false,
+                normalized: false,
+                special: true,
+            })
+            .collect();
+        let added_tokens = AddedTokens::from_configs(&added_configs).map_err(Error::Model)?;
+
+        let decoder = Some(Decoder::from_config(DecoderConfig::ByteLevel)?);
+
+        Ok(Self {
+            added_tokens,
+            normalizer: None,
+            pre_tokenizer,
+            model,
+            post_processor: None,
+            decoder,
+            split_only,
+            input_cache: input_cache_from_env(),
+        })
+    }
+
+    /// Create a tokenizer from the contents of a tiktoken model file
+    /// (`base64(token_bytes) rank` lines). See [`Self::from_tiktoken_ranks`].
+    pub fn from_tiktoken_str(contents: &str, config: TiktokenConfig) -> Result<Self, Error> {
+        let ranks = tiktoken::parse_tiktoken_model(contents)?;
+        Self::from_tiktoken_ranks(&ranks, config)
+    }
+
+    /// Create a tokenizer from a tiktoken model file on disk (e.g.
+    /// `tiktoken.model`). See [`Self::from_tiktoken_ranks`].
+    pub fn from_tiktoken_file(path: &Path, config: TiktokenConfig) -> Result<Self, Error> {
+        let contents = fs::read_to_string(path)?;
+        Self::from_tiktoken_str(&contents, config)
     }
 
     /// Download `tokenizer.json` from HuggingFace Hub for the given model (e.g.
@@ -252,10 +499,22 @@ impl Tokenizer {
         self.encode_with_special_tokens(input, false)
     }
 
+    /// Enable the opt-in prefix cache (see [`InputCache`]) retaining up to
+    /// `capacity` recent encodings. Reuses the leading token ids of inputs that
+    /// share a byte prefix (shared system prompts / long shared contexts), and
+    /// the whole encoding of an exact repeat. Leave it off for wholly-unique
+    /// traffic.
+    pub fn enable_input_cache(&mut self, capacity: usize) {
+        self.input_cache = Some(Mutex::new(InputCache::new(capacity)));
+    }
+
     /// Run the full encoding pipeline with control over special token insertion.
     ///
     /// When `add_special_tokens` is true, the post-processor inserts special
     /// tokens (e.g. BOS/EOS) as configured in the tokenizer's post-processor.
+    ///
+    /// The prefix cache (if enabled) is applied inside the scanner fast path,
+    /// which is where shared-prefix inputs are tokenized.
     pub fn encode_with_special_tokens(
         &self,
         input: &str,
@@ -298,6 +557,67 @@ impl Tokenizer {
 
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
+            // Scanner fast path: for a recognized tiktoken pattern with a single
+            // plain-text segment (no added/special tokens matched), skip the
+            // regex + `Split` materialization — scan pretoken ranges directly
+            // and BPE over them. Falls back to the regex path otherwise.
+            if pts.splits().len() == 1
+                && pts.splits()[0].token_id.is_none()
+                && pts.buffer().len() <= u32::MAX as usize
+                && let PreTokenizer::Split(inner) = split
+                && let Some(kind) = inner.scan_kind()
+            {
+                let buffer = pts.buffer();
+                // Fused scan+BPE of a plain-text segment: one pass, split at
+                // newline boundaries, each segment scanned and BPE'd inline
+                // while hot in cache — no range list is materialized.
+                let scan_seg = |seg: &str| {
+                    let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
+                    self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
+                    Ok(ids)
+                };
+
+                // Prefix cache: reuse the leading ids shared with a cached input
+                // and tokenize only the tail, or reuse an exact repeat wholesale.
+                if let Some(cache) = &self.input_cache {
+                    let plan = cache.lock().unwrap().reuse_plan(buffer.as_bytes());
+                    if let Some(r) = plan {
+                        let mut ids =
+                            Vec::with_capacity(r.tokens + (buffer.len() - r.tail_start) / 3 + 1);
+                        ids.extend_from_slice(&r.core_ids[..r.tokens]);
+                        if r.tail_start < buffer.len() {
+                            let tail = crate::pre_tokenized::tokenize_scanned(
+                                &buffer[r.tail_start..],
+                                scan_seg,
+                            )
+                            .map_err(Error::Model)?;
+                            ids.extend_from_slice(&tail);
+                        }
+                        return Ok(self.post_process(ids, add_special_tokens));
+                    }
+                    // Miss: full encode recording reuse boundaries, then cache it.
+                    let scan_seg_rec = |seg: &str| {
+                        let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
+                        let mut b = Vec::new();
+                        self.model
+                            .tokenize_scanned_segment_rec(kind, seg, &mut ids, &mut b)?;
+                        Ok((ids, b))
+                    };
+                    let (ids, bounds) =
+                        crate::pre_tokenized::tokenize_scanned_with_bounds(buffer, scan_seg_rec)
+                            .map_err(Error::Model)?;
+                    cache
+                        .lock()
+                        .unwrap()
+                        .insert(buffer.as_bytes(), &ids, bounds);
+                    return Ok(self.post_process(ids, add_special_tokens));
+                }
+
+                let ids = crate::pre_tokenized::tokenize_scanned(buffer, scan_seg)
+                    .map_err(Error::Model)?;
+                return Ok(self.post_process(ids, add_special_tokens));
+            }
+
             split.pre_tokenize(&mut pts)?;
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {

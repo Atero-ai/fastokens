@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::pre_tokenized::{PreTokenizedString, Split as PtSplit};
 
 use super::Error;
+use super::scan::{self, ScanKind};
 
 // Thread-local cache of previous Split results for incremental re-use.
 thread_local! {
@@ -153,6 +154,9 @@ pub struct Split {
     /// Compiled opportunistically for all patterns; `None` only if PCRE2
     /// cannot handle the pattern syntax.
     pcre2_regexes: Option<Vec<Pcre2Regex>>,
+    /// Set when the pattern is a recognized tiktoken family, enabling the
+    /// hand-written scanner fast path (see [`Self::scan_kind`]).
+    scan: Option<ScanKind>,
 }
 
 /// Compile PCRE2 JIT regexes from `source`, returning `None` if PCRE2 cannot
@@ -188,6 +192,7 @@ impl TryFrom<SplitRaw> for Split {
 
     fn try_from(raw: SplitRaw) -> Result<Self, Error> {
         let source = raw.pattern.source();
+        let scan = scan::recognize(&source);
         let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
         let regexes = compile_regexes(&source, max_parallel())?;
         Ok(Self {
@@ -196,6 +201,7 @@ impl TryFrom<SplitRaw> for Split {
             behavior: raw.behavior,
             invert: raw.invert,
             pcre2_regexes,
+            scan,
         })
     }
 }
@@ -208,6 +214,7 @@ impl Split {
     pub fn from_config(pattern: &Value, behavior: &str, invert: bool) -> Result<Self, Error> {
         let pattern: Pattern = serde_json::from_value(pattern.clone())?;
         let source = pattern.source();
+        let scan = scan::recognize(&source);
         let regexes = compile_regexes(&source, max_parallel())?;
         let behavior: SplitBehavior = serde_json::from_value(Value::String(behavior.to_string()))?;
         let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
@@ -217,7 +224,16 @@ impl Split {
             behavior,
             invert,
             pcre2_regexes,
+            scan,
         })
+    }
+
+    /// The recognized scanner family for this Split, if it is eligible for the
+    /// scanner fast path (`Isolated`, not inverted). Used by the fused
+    /// scan+BPE encode path.
+    pub fn scan_kind(&self) -> Option<ScanKind> {
+        let kind = self.scan?;
+        (self.behavior == SplitBehavior::Isolated && !self.invert).then_some(kind)
     }
 
     /// Refine the splits of a [`PreTokenizedString`] in place.

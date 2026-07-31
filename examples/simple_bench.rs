@@ -263,7 +263,7 @@ fn bench_batched(
 ) -> Result<()> {
     use tokenizers::EncodeInput;
 
-    let num_batches = (chunks.len() + batch_size - 1) / batch_size;
+    let num_batches = chunks.len().div_ceil(batch_size);
 
     let pb = if verbose {
         ProgressBar::hidden()

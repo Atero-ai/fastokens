@@ -83,6 +83,14 @@ class Tokenizer:
     @staticmethod
     def from_model(model: str) -> "Tokenizer": ...
 
+    @staticmethod
+    def from_tiktoken(
+        path: str,
+        pattern: Optional[str] = None,
+        special_tokens: Optional[dict[str, int]] = None,
+        encoding: Optional[str] = None,
+    ) -> "Tokenizer": ...
+
     @property
     def vocab_size(self) -> int: ...
 
@@ -128,6 +136,18 @@ class Tokenizer:
     def encode_batch(
         self, inputs: list[str], add_special_tokens: bool = False
     ) -> list[Encoding]: ...
+    def encode_batch_flat(
+        self, inputs: list[str], add_special_tokens: bool = False
+    ) -> tuple[bytes, bytes]:
+        """Encode a batch into a single flat token buffer for high-throughput
+        bulk tokenization. Returns ``(ids, offsets)``: ``ids`` is every input's
+        token ids concatenated as little-endian ``uint32`` bytes, and
+        ``offsets`` is ``len(inputs) + 1`` little-endian ``uint64`` values, so
+        input ``i``'s tokens are ``ids[offsets[i]:offsets[i+1]]``. Decode with
+        ``numpy.frombuffer(ids, numpy.uint32)`` and
+        ``numpy.frombuffer(offsets, numpy.uint64)``. No per-token Python objects
+        are created. Truncation applies per input; padding does not (the result
+        is ragged, addressed by ``offsets``)."""
 
     def decode_tokens(self, tokens: list[str]) -> str: ...
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str: ...

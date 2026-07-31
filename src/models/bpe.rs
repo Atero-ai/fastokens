@@ -97,6 +97,43 @@ impl MergeMap {
     }
 }
 
+/// Bigram bridgeability table for vocab-aware safe splitting.
+///
+/// For each of 256×256 possible byte pairs, records whether that pair
+/// appears in any vocabulary token. Used to identify split points that
+/// cannot be crossed by BPE merges.
+#[derive(Clone, PartialEq)]
+pub struct BigramBridgeTable {
+    /// Flat array: bridgeable[prev * 256 + cur] == true if some vocab
+    /// token contains adjacent bytes (prev, cur).
+    bridgeable: Box<[bool; 65536]>,
+}
+
+impl BigramBridgeTable {
+    /// Check if a byte pair can be bridged by some vocab token.
+    #[inline(always)]
+    pub fn is_bridgeable(&self, prev: u8, cur: u8) -> bool {
+        self.bridgeable[prev as usize * 256 + cur as usize]
+    }
+}
+
+/// Build a bigram bridge table by scanning all vocab tokens.
+fn build_bigram_bridge_table(id_to_token: &[String]) -> BigramBridgeTable {
+    let mut bridgeable = Box::new([false; 65536]);
+
+    for token_str in id_to_token {
+        let bytes = token_str.as_bytes();
+        // Mark all adjacent byte pairs in this token as bridgeable
+        for window in bytes.windows(2) {
+            let prev = window[0] as usize;
+            let cur = window[1] as usize;
+            bridgeable[prev * 256 + cur] = true;
+        }
+    }
+
+    BigramBridgeTable { bridgeable }
+}
+
 #[inline(always)]
 fn pack_pair(t1: u32, t2: u32) -> u64 {
     (t1 as u64) << 32 | t2 as u64
@@ -666,7 +703,6 @@ struct RawBpe {
     #[allow(dead_code)]
     fuse_unk: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     byte_fallback: bool,
     #[serde(default)]
     ignore_merges: bool,
@@ -894,10 +930,17 @@ pub struct Bpe {
     id_to_token: Vec<String>,
     token_to_id: FxHashMap<String, u32>,
     byte_to_initial_token: [u32; 256],
+    byte_fallback_token_ids: [u32; 256],
+    /// Token id for each single ASCII-character string (`INVALID_TOKEN` when
+    /// absent). Fast path for the char-based merge engine, avoiding a HashMap
+    /// probe per character.
+    single_char_token: [u32; 128],
     ranked_merge_map: RankedMergeMap,
     byte_pair_initial: Vec<(u32, u32)>,
     merge_adj: MergeAdjacency,
     ignore_merges: bool,
+    byte_fallback: bool,
+    pub bigram_bridge_table: BigramBridgeTable,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -907,6 +950,7 @@ impl TryFrom<RawBpe> for Bpe {
         let merge_map = parse_merges(&raw.vocab, &raw.merges)?;
         let mut bpe = Self::new(&raw.vocab, merge_map)?;
         bpe.ignore_merges = raw.ignore_merges;
+        bpe.byte_fallback = raw.byte_fallback;
         Ok(bpe)
     }
 }
@@ -1119,6 +1163,14 @@ impl Bpe {
             }
         }
 
+        let mut byte_fallback_token_ids = [INVALID_TOKEN; 256];
+        for byte_val in 0u16..256 {
+            let token = format!("<0x{byte_val:02X}>");
+            if let Some(&id) = vocab.get(token.as_str()) {
+                byte_fallback_token_ids[byte_val as usize] = id;
+            }
+        }
+
         // Pre-compute initial byte-pair merges (256×256 table).
         let mut byte_pair_initial = vec![(u32::MAX, 0u32); 65536];
         for b1 in 0u16..256 {
@@ -1137,8 +1189,19 @@ impl Bpe {
             }
         }
 
+        let mut single_char_token = [INVALID_TOKEN; 128];
+        for (byte, slot) in single_char_token.iter_mut().enumerate() {
+            let ch = byte as u8 as char;
+            let mut buf = [0u8; 1];
+            if let Some(&id) = vocab.get(ch.encode_utf8(&mut buf) as &str) {
+                *slot = id;
+            }
+        }
+
         let vocab_size = id_to_token.len();
         let merge_adj = MergeAdjacency::from_parsed(&merge_map, vocab_size);
+
+        let bigram_bridge_table = build_bigram_bridge_table(&id_to_token);
 
         Ok(Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -1155,10 +1218,14 @@ impl Bpe {
                 m
             },
             byte_to_initial_token,
+            byte_fallback_token_ids,
+            single_char_token,
             ranked_merge_map,
             byte_pair_initial,
             merge_adj,
             ignore_merges: false,
+            byte_fallback: false,
+            bigram_bridge_table,
         })
     }
 
@@ -1330,20 +1397,46 @@ impl Bpe {
             for ch in input.chars() {
                 let mut buf = [0u8; 4];
                 let s = ch.encode_utf8(&mut buf);
-                let id = self
-                    .token_to_id
-                    .get(s)
-                    .copied()
-                    .ok_or_else(|| format!("character {ch:?} not in vocabulary"))?;
-                scratch.symbols.push(MergeSymbol {
-                    c: id,
-                    prev: if n == 0 { -1 } else { (n - 1) as i32 },
-                    next: -1,
-                });
-                if n > 0 {
-                    scratch.symbols[n - 1].next = n as i32;
+                let found = if ch.is_ascii() {
+                    let id = self.single_char_token[ch as usize];
+                    (id != INVALID_TOKEN).then_some(id)
+                } else {
+                    self.token_to_id.get(s).copied()
+                };
+                if let Some(id) = found {
+                    scratch.symbols.push(MergeSymbol {
+                        c: id,
+                        prev: if n == 0 { -1 } else { (n - 1) as i32 },
+                        next: -1,
+                    });
+                    if n > 0 {
+                        scratch.symbols[n - 1].next = n as i32;
+                    }
+                    n += 1;
+                    continue;
                 }
-                n += 1;
+
+                if !self.byte_fallback {
+                    return Err(format!("character {ch:?} not in vocabulary"));
+                }
+
+                for &byte in s.as_bytes() {
+                    let id = self.byte_fallback_token_ids[byte as usize];
+                    if id == INVALID_TOKEN {
+                        return Err(format!(
+                            "byte fallback token <0x{byte:02X}> not in vocabulary"
+                        ));
+                    }
+                    scratch.symbols.push(MergeSymbol {
+                        c: id,
+                        prev: if n == 0 { -1 } else { (n - 1) as i32 },
+                        next: -1,
+                    });
+                    if n > 0 {
+                        scratch.symbols[n - 1].next = n as i32;
+                    }
+                    n += 1;
+                }
             }
 
             if n == 1 {
@@ -1917,10 +2010,14 @@ impl Clone for Bpe {
             id_to_token: self.id_to_token.clone(),
             token_to_id: self.token_to_id.clone(),
             byte_to_initial_token: self.byte_to_initial_token,
+            byte_fallback_token_ids: self.byte_fallback_token_ids,
+            single_char_token: self.single_char_token,
             ranked_merge_map: self.ranked_merge_map.clone(),
             byte_pair_initial: self.byte_pair_initial.clone(),
             merge_adj: self.merge_adj.clone(),
             ignore_merges: self.ignore_merges,
+            byte_fallback: self.byte_fallback,
+            bigram_bridge_table: self.bigram_bridge_table.clone(),
         }
     }
 }
@@ -1942,6 +2039,7 @@ impl PartialEq for Bpe {
             && self.next_prefix_map == other.next_prefix_map
             && self.token_lens == other.token_lens
             && self.ignore_merges == other.ignore_merges
+            && self.byte_fallback == other.byte_fallback
     }
 }
 

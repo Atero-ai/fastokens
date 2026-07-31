@@ -114,4 +114,11 @@ impl Model {
             Self::Bpe(bpe) => bpe.vocab_size(),
         }
     }
+
+    /// Access the bigram bridge table for vocab-aware splitting.
+    pub fn bigram_bridge_table(&self) -> Option<&bpe::BigramBridgeTable> {
+        match self {
+            Self::Bpe(bpe) => Some(&bpe.bigram_bridge_table),
+        }
+    }
 }

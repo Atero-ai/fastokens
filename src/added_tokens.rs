@@ -16,6 +16,11 @@ pub struct AddedTokens {
     /// Token lengths (in bytes) indexed by token ID, for matched tokens only.
     /// Non-added token IDs map to 0.
     token_lens: Vec<usize>,
+    /// Per-ID `lstrip`/`rstrip` flags. When set, a match absorbs adjacent
+    /// Unicode whitespace (left/right) into the token span, matching HF's
+    /// `AddedToken` behavior. Indexed by token ID; `false` for non-added IDs.
+    lstrip: Vec<bool>,
+    rstrip: Vec<bool>,
     /// Distinct first bytes of all added token strings. Used to quickly skip
     /// positions that cannot start any token via SIMD memchr.
     start_bytes: Vec<u8>,
@@ -59,6 +64,8 @@ impl AddedTokens {
 
         let max_id = configs.iter().map(|c| c.id).max().unwrap_or(0);
         let mut token_lens = vec![0usize; (max_id + 1) as usize];
+        let mut lstrip = vec![false; (max_id + 1) as usize];
+        let mut rstrip = vec![false; (max_id + 1) as usize];
 
         let mut id_to_content = HashMap::with_capacity(configs.len());
         let mut special_ids = HashSet::new();
@@ -69,6 +76,8 @@ impl AddedTokens {
             .iter()
             .map(|c| {
                 token_lens[c.id as usize] = c.content.len();
+                lstrip[c.id as usize] = c.lstrip;
+                rstrip[c.id as usize] = c.rstrip;
                 id_to_content.insert(c.id, c.content.clone());
                 content_to_id.insert(c.content.clone(), c.id);
                 if c.special {
@@ -102,6 +111,8 @@ impl AddedTokens {
         Ok(Some(Self {
             daac,
             token_lens,
+            lstrip,
+            rstrip,
             start_bytes,
             max_token_len,
             id_to_content,
@@ -204,11 +215,13 @@ impl AddedTokens {
             if let Some(m) = self.daac.leftmost_find_iter(window).next()
                 && m.start() == 0
             {
-                if pos > prev_end {
-                    segments.push(Segment::Text(&input[prev_end..pos]));
+                let (start, end) =
+                    self.strip_bounds(input, m.value(), pos, pos + m.end(), prev_end);
+                if start > prev_end {
+                    segments.push(Segment::Text(&input[prev_end..start]));
                 }
                 segments.push(Segment::Token(m.value()));
-                prev_end = pos + m.end();
+                prev_end = end;
             }
         }
 
@@ -222,17 +235,57 @@ impl AddedTokens {
         segments
     }
 
+    /// Expand a match span to absorb adjacent Unicode whitespace per the
+    /// token's `lstrip`/`rstrip` flags, matching HuggingFace `AddedToken`
+    /// behavior. Absorbed whitespace is excluded from the surrounding text.
+    ///
+    /// `lstrip` extends the start left over whitespace, bounded by `floor`
+    /// (the end of the previous segment) so it never reclaims already-emitted
+    /// text. `rstrip` extends the end right over whitespace. When two strip
+    /// tokens share a whitespace run, the left token's `rstrip` consumes it
+    /// first (via the advanced `floor`), so the right token's `lstrip` finds
+    /// none — mirroring HF's left-to-right resolution.
+    fn strip_bounds(
+        &self,
+        input: &str,
+        id: u32,
+        mut start: usize,
+        mut end: usize,
+        floor: usize,
+    ) -> (usize, usize) {
+        if self.lstrip[id as usize] {
+            for (rel_i, c) in input[floor..start].char_indices().rev() {
+                if c.is_whitespace() {
+                    start = floor + rel_i;
+                } else {
+                    break;
+                }
+            }
+        }
+        if self.rstrip[id as usize] {
+            for c in input[end..].chars() {
+                if c.is_whitespace() {
+                    end += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+        }
+        (start, end)
+    }
+
     /// Full-scan fallback for >3 distinct start bytes.
     fn split_full_scan<'a>(&self, input: &'a str) -> Vec<Segment<'a>> {
         let mut segments = Vec::new();
         let mut prev_end = 0;
 
         for m in self.daac.leftmost_find_iter(input) {
-            if m.start() > prev_end {
-                segments.push(Segment::Text(&input[prev_end..m.start()]));
+            let (start, end) = self.strip_bounds(input, m.value(), m.start(), m.end(), prev_end);
+            if start > prev_end {
+                segments.push(Segment::Text(&input[prev_end..start]));
             }
             segments.push(Segment::Token(m.value()));
-            prev_end = m.end();
+            prev_end = end;
         }
 
         if prev_end < input.len() {
@@ -565,6 +618,119 @@ mod tests {
         assert_eq!(
             segs,
             vec![Segment::Token(9), Segment::Token(9), Segment::Token(9)]
+        );
+    }
+
+    // ── lstrip / rstrip whitespace absorption ───────────────────────────
+
+    fn make_strip_config(id: u32, content: &str, lstrip: bool, rstrip: bool) -> AddedTokenConfig {
+        AddedTokenConfig {
+            id,
+            content: content.to_string(),
+            single_word: false,
+            lstrip,
+            rstrip,
+            normalized: false,
+            special: true,
+        }
+    }
+
+    #[test]
+    fn lstrip_absorbs_leading_whitespace() {
+        let configs = vec![make_strip_config(1, "<s>", true, false)];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        // The spaces before <s> are absorbed into the token span; "ab" remains,
+        // trailing "cd" is untouched.
+        assert_eq!(
+            at.split("ab   <s>cd"),
+            vec![Segment::Text("ab"), Segment::Token(1), Segment::Text("cd")]
+        );
+    }
+
+    #[test]
+    fn rstrip_absorbs_trailing_whitespace() {
+        let configs = vec![make_strip_config(1, "<s>", false, true)];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("ab<s>   cd"),
+            vec![Segment::Text("ab"), Segment::Token(1), Segment::Text("cd")]
+        );
+    }
+
+    #[test]
+    fn strip_both_sides() {
+        let configs = vec![make_strip_config(1, "<s>", true, true)];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("ab \t <s> \n cd"),
+            vec![Segment::Text("ab"), Segment::Token(1), Segment::Text("cd")]
+        );
+    }
+
+    #[test]
+    fn no_strip_keeps_whitespace() {
+        let configs = vec![make_strip_config(1, "<s>", false, false)];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("ab <s> cd"),
+            vec![
+                Segment::Text("ab "),
+                Segment::Token(1),
+                Segment::Text(" cd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn adjacent_strip_tokens_share_whitespace() {
+        // The <|im_end|>\n<|im_start|> case from Phi-4: both tokens strip both
+        // sides. The single \n between them must be absorbed exactly once and
+        // produce no text token.
+        let configs = vec![
+            make_strip_config(1, "<|im_end|>", true, true),
+            make_strip_config(2, "<|im_start|>", true, true),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("hi<|im_end|>\n<|im_start|>user"),
+            vec![
+                Segment::Text("hi"),
+                Segment::Token(1),
+                Segment::Token(2),
+                Segment::Text("user"),
+            ]
+        );
+    }
+
+    #[test]
+    fn lstrip_bounded_by_previous_token() {
+        // A preceding token's span must not be reclaimed by the next token's
+        // lstrip: there is no whitespace between the tokens here.
+        let configs = vec![
+            make_strip_config(1, "<a>", false, false),
+            make_strip_config(2, "<b>", true, false),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("<a><b>"),
+            vec![Segment::Token(1), Segment::Token(2)]
+        );
+    }
+
+    #[test]
+    fn strip_via_full_scan_path() {
+        // >3 distinct start bytes forces the full-scan path; rstrip must still
+        // absorb trailing whitespace there.
+        let configs = vec![
+            make_strip_config(1, "<bos>", false, true),
+            make_config(2, "[SEP]"),
+            make_config(3, "{pad}"),
+            make_config(4, "|mask|"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("<bos>   x"),
+            vec![Segment::Token(1), Segment::Text("x")]
         );
     }
 }

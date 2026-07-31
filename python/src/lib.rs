@@ -382,6 +382,22 @@ struct TokenizerState {
     post_processor_json: Option<String>,
 }
 
+fn tokenizer_options(
+    pcre2_match_limit: Option<u32>,
+    pcre2_depth_limit: Option<u32>,
+    pcre2_heap_limit: Option<u32>,
+    pcre2_max_jit_stack_size: Option<usize>,
+) -> fastokens::TokenizerOptions {
+    fastokens::TokenizerOptions {
+        pcre2_limits: fastokens::Pcre2Limits {
+            match_limit: pcre2_match_limit,
+            depth_limit: pcre2_depth_limit,
+            heap_limit: pcre2_heap_limit,
+            max_jit_stack_size: pcre2_max_jit_stack_size,
+        },
+    }
+}
+
 impl TokenizerState {
     fn do_truncate(&self, ids: &mut Vec<u32>) {
         let Some(ref t) = self.trunc else { return };
@@ -444,7 +460,11 @@ impl PyTokenizer {
 
     /// Build from a raw JSON string, extracting the post-processor field so
     /// the getter can return it without needing to re-serialize.
-    fn build_from_str(json: &str, py: Python<'_>) -> PyResult<Self> {
+    fn build_from_str(
+        json: &str,
+        py: Python<'_>,
+        options: fastokens::TokenizerOptions,
+    ) -> PyResult<Self> {
         let value: Value =
             serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let post_processor_json = value
@@ -452,7 +472,10 @@ impl PyTokenizer {
             .filter(|v| !v.is_null())
             .map(|v| v.to_string());
         let inner = py
-            .allow_threads(|| fastokens::Tokenizer::from_json(value).map_err(|e| e.to_string()))
+            .allow_threads(|| {
+                fastokens::Tokenizer::from_json_with_options(value, options)
+                    .map_err(|e| e.to_string())
+            })
             .map_err(PyValueError::new_err)?;
         Ok(Self {
             state: RwLock::new(TokenizerState {
@@ -472,34 +495,100 @@ impl PyTokenizer {
     ///
     /// (This is an alias for Tokenizer.from_model)
     #[new]
-    fn new(model: &str, py: Python<'_>) -> PyResult<Self> {
-        Self::from_model(model, py)
+    #[pyo3(signature = (model, pcre2_match_limit = None, pcre2_depth_limit = None, pcre2_heap_limit = None, pcre2_max_jit_stack_size = None))]
+    fn new(
+        model: &str,
+        pcre2_match_limit: Option<u32>,
+        pcre2_depth_limit: Option<u32>,
+        pcre2_heap_limit: Option<u32>,
+        pcre2_max_jit_stack_size: Option<usize>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        Self::from_model(
+            model,
+            pcre2_match_limit,
+            pcre2_depth_limit,
+            pcre2_heap_limit,
+            pcre2_max_jit_stack_size,
+            py,
+        )
     }
 
     /// Create a tokenizer from a `tokenizer.json` file.
     #[staticmethod]
-    fn from_file(path: &str, py: Python<'_>) -> PyResult<Self> {
+    #[pyo3(signature = (path, pcre2_match_limit = None, pcre2_depth_limit = None, pcre2_heap_limit = None, pcre2_max_jit_stack_size = None))]
+    fn from_file(
+        path: &str,
+        pcre2_match_limit: Option<u32>,
+        pcre2_depth_limit: Option<u32>,
+        pcre2_heap_limit: Option<u32>,
+        pcre2_max_jit_stack_size: Option<usize>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
         let json = std::fs::read_to_string(path)
             .map_err(|e| PyValueError::new_err(format!("cannot read {path}: {e}")))?;
-        Self::build_from_str(&json, py)
+        Self::build_from_str(
+            &json,
+            py,
+            tokenizer_options(
+                pcre2_match_limit,
+                pcre2_depth_limit,
+                pcre2_heap_limit,
+                pcre2_max_jit_stack_size,
+            ),
+        )
     }
 
     /// Create a tokenizer from a raw JSON string for `tokenizer.json`.
     #[staticmethod]
-    fn from_json_str(json: &str, py: Python<'_>) -> PyResult<Self> {
-        Self::build_from_str(json, py)
+    #[pyo3(signature = (json, pcre2_match_limit = None, pcre2_depth_limit = None, pcre2_heap_limit = None, pcre2_max_jit_stack_size = None))]
+    fn from_json_str(
+        json: &str,
+        pcre2_match_limit: Option<u32>,
+        pcre2_depth_limit: Option<u32>,
+        pcre2_heap_limit: Option<u32>,
+        pcre2_max_jit_stack_size: Option<usize>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        Self::build_from_str(
+            json,
+            py,
+            tokenizer_options(
+                pcre2_match_limit,
+                pcre2_depth_limit,
+                pcre2_heap_limit,
+                pcre2_max_jit_stack_size,
+            ),
+        )
     }
 
     /// Download `tokenizer.json` from HuggingFace Hub for the given model
     /// (e.g. `"meta-llama/Llama-3.1-8B"`) and create a tokenizer with it.
     #[staticmethod]
-    fn from_model(model: &str, py: Python<'_>) -> PyResult<Self> {
+    #[pyo3(signature = (model, pcre2_match_limit = None, pcre2_depth_limit = None, pcre2_heap_limit = None, pcre2_max_jit_stack_size = None))]
+    fn from_model(
+        model: &str,
+        pcre2_match_limit: Option<u32>,
+        pcre2_depth_limit: Option<u32>,
+        pcre2_heap_limit: Option<u32>,
+        pcre2_max_jit_stack_size: Option<usize>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
         let json = py
             .allow_threads(|| {
                 fastokens::Tokenizer::download_tokenizer_json(model).map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        Self::build_from_str(&json, py)
+        Self::build_from_str(
+            &json,
+            py,
+            tokenizer_options(
+                pcre2_match_limit,
+                pcre2_depth_limit,
+                pcre2_heap_limit,
+                pcre2_max_jit_stack_size,
+            ),
+        )
     }
 
     /// Create a tokenizer from a tiktoken model file (e.g. `tiktoken.model`,

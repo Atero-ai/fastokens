@@ -28,7 +28,7 @@ pub use self::{
     models::Model,
     normalizers::{Nfc, Normalizer},
     post_processors::PostProcessor,
-    pre_tokenizers::{ByteLevel, PreTokenizer, Split, SplitBehavior},
+    pre_tokenizers::{ByteLevel, Pcre2Limits, PreTokenizer, Split, SplitBehavior},
     tiktoken::{CL100K_BASE_PATTERN, O200K_BASE_PATTERN, TiktokenConfig},
 };
 
@@ -42,7 +42,7 @@ use self::{
 mod hf_hub_support {
     pub use hf_hub::api::sync::ApiError;
 
-    use super::{Error, Tokenizer, TokenizerJson};
+    use super::{Error, Tokenizer, TokenizerJson, TokenizerOptions};
     use hf_hub::api::sync::{Api, ApiBuilder};
     use std::fs;
 
@@ -69,13 +69,21 @@ mod hf_hub_support {
     /// Used by `Tokenizer::from_model` and `Tokenizer::from_model_with_token` to fetch
     /// `tokenizer.json` from the HuggingFace Hub and build a `Tokenizer`.
     pub fn from_model_with_token(model: &str, token: Option<&str>) -> Result<Tokenizer, Error> {
+        from_model_with_token_and_options(model, token, TokenizerOptions::default())
+    }
+
+    pub fn from_model_with_token_and_options(
+        model: &str,
+        token: Option<&str>,
+        options: TokenizerOptions,
+    ) -> Result<Tokenizer, Error> {
         validate_model_id(model)?;
         let api = make_api(token)?;
         let repo = api.model(model.to_string());
         let json_path = repo.get("tokenizer.json")?;
         let raw = fs::read_to_string(json_path)?;
         let json: TokenizerJson = serde_json::from_str(&raw)?;
-        Tokenizer::build(json)
+        Tokenizer::build_with_options(json, options)
     }
 
     /// Used by the Python layer to fetch `tokenizer.json` from the HuggingFace Hub and
@@ -285,6 +293,12 @@ fn input_cache_from_env() -> Option<Mutex<InputCache>> {
         .map(|c| Mutex::new(InputCache::new(c)))
 }
 
+/// Options applied while constructing a [`Tokenizer`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenizerOptions {
+    pub pcre2_limits: Pcre2Limits,
+}
+
 /// An LLM tokenizer backed by `tokenizer.json`.
 pub struct Tokenizer {
     added_tokens: Option<AddedTokens>,
@@ -303,11 +317,15 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Build the pipeline steps from a parsed JSON config.
     fn build(json: TokenizerJson) -> Result<Self, Error> {
+        Self::build_with_options(json, TokenizerOptions::default())
+    }
+
+    fn build_with_options(json: TokenizerJson, options: TokenizerOptions) -> Result<Self, Error> {
         let added_tokens = AddedTokens::from_configs(&json.added_tokens).map_err(Error::Model)?;
         let normalizer = json.normalizer.map(Normalizer::from_config).transpose()?;
         let pre_tokenizer = json
             .pre_tokenizer
-            .map(PreTokenizer::from_config)
+            .map(|config| PreTokenizer::from_config_with_limits(config, options.pcre2_limits))
             .transpose()?;
         let model = Model::from_config(json.model).map_err(Error::Model)?;
         let post_processor = json
@@ -353,6 +371,12 @@ impl Tokenizer {
     pub fn from_json(json: Value) -> Result<Self, Error> {
         let json: TokenizerJson = serde_json::from_value(json)?;
         Self::build(json)
+    }
+
+    /// Create a tokenizer from a raw JSON value for `tokenizer.json` with construction options.
+    pub fn from_json_with_options(json: Value, options: TokenizerOptions) -> Result<Self, Error> {
+        let json: TokenizerJson = serde_json::from_value(json)?;
+        Self::build_with_options(json, options)
     }
 
     /// Create a tokenizer from a `tokenizer.json` file.
@@ -434,6 +458,12 @@ impl Tokenizer {
         Self::from_tiktoken_str(&contents, config)
     }
 
+    /// Create a tokenizer from a `tokenizer.json` file with construction options.
+    pub fn from_file_with_options(path: &Path, options: TokenizerOptions) -> Result<Self, Error> {
+        let json: TokenizerJson = serde_json::from_str(&fs::read_to_string(path)?)?;
+        Self::build_with_options(json, options)
+    }
+
     /// Download `tokenizer.json` from HuggingFace Hub for the given model (e.g.
     /// `"meta-llama/Llama-3.1-8B"`) and create a tokenizer with it.
     ///
@@ -445,12 +475,28 @@ impl Tokenizer {
         Self::from_model_with_token(model, None)
     }
 
+    /// Like [`Self::from_model`] but accepts construction options.
+    #[cfg(feature = "hf-hub")]
+    pub fn from_model_with_options(model: &str, options: TokenizerOptions) -> Result<Self, Error> {
+        Self::from_model_with_token_and_options(model, None, options)
+    }
+
     /// Like [`Self::from_model`] but accepts an explicit HuggingFace token,
     /// overriding the credential cache.  Pass `None` to use the credential
     /// cache (`~/.cache/huggingface/token`, set via `huggingface-cli login`).
     #[cfg(feature = "hf-hub")]
     pub fn from_model_with_token(model: &str, token: Option<&str>) -> Result<Self, Error> {
         hf_hub_support::from_model_with_token(model, token)
+    }
+
+    /// Like [`Self::from_model_with_token`] but accepts construction options.
+    #[cfg(feature = "hf-hub")]
+    pub fn from_model_with_token_and_options(
+        model: &str,
+        token: Option<&str>,
+        options: TokenizerOptions,
+    ) -> Result<Self, Error> {
+        hf_hub_support::from_model_with_token_and_options(model, token, options)
     }
 
     /// Download `tokenizer.json` and return its raw content without building
@@ -939,6 +985,45 @@ pub fn decode_stream_step(
         Ok(Some(new_text))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn from_json_with_options_propagates_pcre2_limits() {
+        let tokenizer = Tokenizer::from_json_with_options(
+            json!({
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"a": 0, "!": 1},
+                    "merges": []
+                },
+                "pre_tokenizer": {
+                    "type": "Split",
+                    "pattern": {"Regex": "^(a+)+$"},
+                    "behavior": "Isolated",
+                    "invert": false
+                }
+            }),
+            TokenizerOptions {
+                pcre2_limits: Pcre2Limits {
+                    match_limit: Some(1),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let err = tokenizer.encode("aaaaaaaaaaaaaaaa!").unwrap_err();
+        assert!(
+            err.to_string().contains("match limit"),
+            "expected match limit error, got {err}"
+        );
     }
 }
 

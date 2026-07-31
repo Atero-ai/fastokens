@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from fastokens._compat import _TokenizerShim
 from fastokens._native import Tokenizer
 
 __all__ = ["Tokenizer", "patch_transformers", "unpatch_transformers"]
@@ -5,6 +8,17 @@ __all__ = ["Tokenizer", "patch_transformers", "unpatch_transformers"]
 
 _patched = False
 _originals: dict = {}
+_patch_pcre2_options: dict[str, int | None] = {
+    "pcre2_match_limit": None,
+    "pcre2_depth_limit": None,
+    "pcre2_heap_limit": None,
+    "pcre2_max_jit_stack_size": None,
+}
+
+
+class _ConfiguredTokenizerShim(_TokenizerShim):
+    def __init__(self, src, **kwargs):
+        super().__init__(src, **{**_patch_pcre2_options, **kwargs})
 
 
 def _swap_backend(tokenizer, shim_cls):
@@ -15,7 +29,12 @@ def _swap_backend(tokenizer, shim_cls):
     return tokenizer
 
 
-def patch_transformers() -> None:
+def patch_transformers(
+    pcre2_match_limit: int | None = None,
+    pcre2_depth_limit: int | None = None,
+    pcre2_heap_limit: int | None = None,
+    pcre2_max_jit_stack_size: int | None = None,
+) -> None:
     """
     Monkey-patch ``tokenizers.Tokenizer`` so that the
     ``transformers`` library uses fastokens for encoding.
@@ -33,14 +52,25 @@ def patch_transformers() -> None:
 
     Supports both transformers v4 (``tokenization_utils_fast``)
     and v5+ (``tokenization_utils_tokenizers``).
+
+    PCRE2 resource limits can be supplied to guard against tokenizer regexes
+    with pathological backtracking on adversarial input.
     """
     global _patched
     if _patched:
         print("[fastokens] patch_transformers: already patched.")
         return
 
-    from fastokens._compat import _TokenizerShim
     from fastokens._native import DecodeStream
+
+    _patch_pcre2_options.update(
+        {
+            "pcre2_match_limit": pcre2_match_limit,
+            "pcre2_depth_limit": pcre2_depth_limit,
+            "pcre2_heap_limit": pcre2_heap_limit,
+            "pcre2_max_jit_stack_size": pcre2_max_jit_stack_size,
+        }
+    )
 
     import tokenizers.decoders as _td
 
@@ -64,7 +94,7 @@ def patch_transformers() -> None:
         @classmethod
         def _patched_from_pretrained(cls, *args, **kwargs):
             tokenizer = _orig_fp.__func__(cls, *args, **kwargs)
-            return _swap_backend(tokenizer, _TokenizerShim)
+            return _swap_backend(tokenizer, _ConfiguredTokenizerShim)
 
         _originals["TokenizersBackend.from_pretrained"] = _orig_fp
         TokenizersBackend.from_pretrained = _patched_from_pretrained
@@ -80,7 +110,7 @@ def patch_transformers() -> None:
             import transformers.tokenization_utils_fast as _tuf
 
             _originals["tokenization_utils_fast"] = (_tuf, _tuf.TokenizerFast)
-            _tuf.TokenizerFast = _TokenizerShim
+            _tuf.TokenizerFast = _ConfiguredTokenizerShim
         except ImportError:
             pass
 
@@ -139,4 +169,12 @@ def unpatch_transformers() -> None:
     _td.DecodeStream = _originals["DecodeStream"]
 
     _originals.clear()
+    _patch_pcre2_options.update(
+        {
+            "pcre2_match_limit": None,
+            "pcre2_depth_limit": None,
+            "pcre2_heap_limit": None,
+            "pcre2_max_jit_stack_size": None,
+        }
+    )
     _patched = False

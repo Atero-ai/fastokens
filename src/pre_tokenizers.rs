@@ -10,7 +10,7 @@ use crate::{
 
 pub use self::{
     byte_level::ByteLevel,
-    split::{Split, SplitBehavior},
+    split::{Pcre2Limits, Split, SplitBehavior, SplitConfig},
 };
 
 pub(crate) use self::byte_level::BYTE_TO_CHAR;
@@ -44,13 +44,22 @@ pub enum PreTokenizer {
 impl PreTokenizer {
     /// Build a pre-tokenizer from its JSON configuration.
     pub fn from_config(config: PreTokenizerConfig) -> Result<Self, Error> {
+        Self::from_config_with_limits(config, Pcre2Limits::default())
+    }
+
+    pub fn from_config_with_limits(
+        config: PreTokenizerConfig,
+        limits: Pcre2Limits,
+    ) -> Result<Self, Error> {
         match config {
             PreTokenizerConfig::ByteLevel(bl) => Ok(Self::ByteLevel(bl)),
-            PreTokenizerConfig::Split(s) => Ok(Self::Split(s)),
+            PreTokenizerConfig::Split(s) => Ok(Self::Split(Split::from_split_config_with_limits(
+                s, limits,
+            )?)),
             PreTokenizerConfig::Sequence { pretokenizers } => {
                 let steps = pretokenizers
                     .into_iter()
-                    .map(Self::from_config)
+                    .map(|config| Self::from_config_with_limits(config, limits))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::Sequence(steps))
             }

@@ -4,13 +4,21 @@ fastokens is a fast [BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) toke
 popular open-weight LLMs, built on top of a high-performance Rust backend. It loads both the
 HuggingFace `tokenizer.json` format and [tiktoken](https://github.com/openai/tiktoken) model files.
 
-`fastokens` can be installed from source:
+`fastokens` publishes prebuilt wheels (Linux, macOS, and Windows; Python 3.9+), so the simplest way
+to install it is from PyPI:
 ```
-git clone https://github.com/atero-ai/fast-tokens
-uv pip install fast-tokens/python
+uv pip install fastokens        # or: pip install fastokens
 ```
 
-The Python API lives in the `python` directory. To use `fastokens` as a drop-in replacement with
+To build from source instead (requires a [Rust toolchain](https://rustup.rs)), clone the repository
+and install its **root** directory. The `pyproject.toml` (a [maturin](https://github.com/PyO3/maturin)
+project) lives at the repo root:
+```
+git clone https://github.com/crusoecloud/fastokens
+uv pip install ./fastokens
+```
+
+To use `fastokens` as a drop-in replacement with
 [transformers](https://github.com/huggingface/transformers), or with [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo), see the
 [usage examples](#usage) below.
 

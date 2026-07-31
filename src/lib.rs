@@ -601,13 +601,11 @@ impl Tokenizer {
                 ids.get(&token.id).copied(),
                 contents.get(&token.content).copied(),
             ) {
-                (Some(index), Some(existing_id)) if existing_id == token.id => {
-                    if added_tokens[index] != token {
-                        return Err(Error::Model(format!(
-                            "conflicting added token metadata for id {} ({:?})",
-                            token.id, token.content
-                        )));
-                    }
+                (Some(_), Some(existing_id)) if existing_id == token.id => {
+                    // Same id + content already present from `tokenizer.json`,
+                    // which is authoritative. Field-level differences between
+                    // the two files (e.g. `special`, `lstrip`) are benign, so
+                    // keep the existing entry rather than rejecting the model.
                 }
                 (Some(index), _) => {
                     return Err(Error::Model(format!(

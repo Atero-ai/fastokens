@@ -1,7 +1,7 @@
 from typing import Optional
 
 class Encoding:
-    """Rust-backed encoding returned by ``Tokenizer.encode`` / ``encode_batch``."""
+    """Rust-backed encoding returned by tokenizer encoding methods."""
 
     ids: list[int]
     attention_mask: list[int]
@@ -132,6 +132,7 @@ class Tokenizer:
     def num_special_tokens_to_add(self, is_pair: bool) -> int: ...
 
     def encode(self, input: str, add_special_tokens: bool = False) -> Encoding: ...
+    def encode_ordinary(self, input: str) -> Encoding: ...
 
     def encode_batch(
         self, inputs: list[str], add_special_tokens: bool = False

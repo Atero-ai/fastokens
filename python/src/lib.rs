@@ -404,6 +404,12 @@ impl TokenizerState {
         }
     }
 
+    fn build_single_encoding(&self, mut ids: Vec<u32>) -> PyEncoding {
+        self.do_truncate(&mut ids);
+        let target = self.single_pad_target(ids.len());
+        build_encoding(ids, self.pad.as_ref(), target)
+    }
+
     /// Parse `json`, update the Rust post-processor in place, and cache the JSON.
     fn update_post_processor_json(&mut self, json: &str) -> PyResult<()> {
         use fastokens::json_structs::PostProcessorConfig;
@@ -699,14 +705,25 @@ impl PyTokenizer {
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
         let state = self.read();
-        let mut ids = state
+        let ids = state
             .inner
             .encode_with_special_tokens(input, add_special_tokens)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        state.do_truncate(&mut ids);
-        let target = state.single_pad_target(ids.len());
+        Py::new(py, state.build_single_encoding(ids))
+    }
 
-        Py::new(py, build_encoding(ids, state.pad.as_ref(), target))
+    /// Encode through the base tokenizer pipeline without recognizing added
+    /// vocabulary entries.
+    ///
+    /// Truncation and padding configured via `enable_truncation` /
+    /// `enable_padding` are applied before returning.
+    fn encode_ordinary(&self, input: &str, py: Python<'_>) -> PyResult<Py<PyEncoding>> {
+        let state = self.read();
+        let ids = state
+            .inner
+            .encode_ordinary(input)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Py::new(py, state.build_single_encoding(ids))
     }
 
     /// Encode a batch of inputs in parallel.

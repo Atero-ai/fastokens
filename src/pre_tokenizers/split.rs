@@ -484,7 +484,7 @@ impl Split {
 
         // Run PCRE2 on the portion after the reusable prefix.
         let suffix = &text[restart_pos..];
-        if suffix.len() >= MIN_CHUNK_SIZE * 2 {
+        if suffix.len() >= MIN_CHUNK_SIZE * 2 && pcre2.len() >= 2 {
             let suffix_matches = self.find_matches_pcre2_parallel(suffix, base + restart_pos)?;
             matches.extend(suffix_matches);
         } else if !suffix.is_empty() {
@@ -1616,6 +1616,23 @@ mod tests {
     }
 
     // ── integration: long match crossing parallel chunk boundary ─────
+
+    #[test]
+    fn long_input_with_single_pcre2_matcher_falls_back_to_sequential() {
+        let mut split = Split::from_config(&json!({"Regex": "\\s+"}), "Isolated", false).unwrap();
+        split.pcre2_regexes.as_mut().unwrap().truncate(1);
+
+        let input = format!(
+            "{} {}",
+            "a".repeat(MIN_CHUNK_SIZE),
+            "b".repeat(MIN_CHUNK_SIZE),
+        );
+        let mut pts = PreTokenizedString::from_text(&input);
+
+        split.pre_tokenize(&mut pts).unwrap();
+
+        assert_eq!(pts_texts(&pts).concat(), input);
+    }
 
     #[test]
     fn long_match_crosses_parallel_boundary() {

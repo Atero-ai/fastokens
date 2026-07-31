@@ -215,7 +215,8 @@ impl AddedTokens {
             if let Some(m) = self.daac.leftmost_find_iter(window).next()
                 && m.start() == 0
             {
-                let (start, end) = self.strip_bounds(input, m.value(), pos, pos + m.end(), prev_end);
+                let (start, end) =
+                    self.strip_bounds(input, m.value(), pos, pos + m.end(), prev_end);
                 if start > prev_end {
                     segments.push(Segment::Text(&input[prev_end..start]));
                 }

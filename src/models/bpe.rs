@@ -1423,7 +1423,9 @@ impl Bpe {
                 for &byte in s.as_bytes() {
                     let id = self.byte_fallback_token_ids[byte as usize];
                     if id == INVALID_TOKEN {
-                        return Err(format!("byte fallback token <0x{byte:02X}> not in vocabulary"));
+                        return Err(format!(
+                            "byte fallback token <0x{byte:02X}> not in vocabulary"
+                        ));
                     }
                     scratch.symbols.push(MergeSymbol {
                         c: id,
@@ -1658,7 +1660,7 @@ impl Bpe {
         }));
     }
 
-#[inline(always)]
+    #[inline(always)]
     fn run_merge_loop(&self, scratch: &mut MergeScratch, out: &mut Vec<u32>) {
         let symbols = &mut scratch.symbols;
         let heap = &mut scratch.heap;

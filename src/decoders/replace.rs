@@ -58,8 +58,8 @@ mod tests {
 
     #[test]
     fn regex_replacement_content_is_literal() {
-        let dec = ReplaceDecoder::from_config(json!({"Regex": "([a-z]+)"}), "$1".to_string())
-            .unwrap();
+        let dec =
+            ReplaceDecoder::from_config(json!({"Regex": "([a-z]+)"}), "$1".to_string()).unwrap();
         let out = dec.decode_chain(vec!["abc".to_string()]);
         assert_eq!(out, vec!["$1"]);
     }

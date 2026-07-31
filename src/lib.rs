@@ -457,6 +457,10 @@ impl Tokenizer {
 
         let decoder = Some(Decoder::from_config(DecoderConfig::ByteLevel)?);
 
+        // tiktoken pipelines are ByteLevel, so vocab-aware splitting is a no-op
+        // cost — the regex `Split` already chunks at word boundaries.
+        let needs_vocab_splitting = !Self::pre_tokenizer_contains_byte_level(&pre_tokenizer);
+
         Ok(Self {
             added_tokens,
             normalizer: None,
@@ -466,6 +470,7 @@ impl Tokenizer {
             decoder,
             split_only,
             input_cache: input_cache_from_env(),
+            needs_vocab_splitting,
         })
     }
 
@@ -708,10 +713,10 @@ impl Tokenizer {
         //     any vocab token. This is provably output-preserving and provides
         //     fine-grained word-level chunking for models that don't use
         //     ByteLevel (whose regex Split already chunks at word boundaries).
-        if self.needs_vocab_splitting {
-            if let Some(table) = self.model.bigram_bridge_table() {
-                split_on_unbridgeable_bigrams(&mut pts, table);
-            }
+        if self.needs_vocab_splitting
+            && let Some(table) = self.model.bigram_bridge_table()
+        {
+            split_on_unbridgeable_bigrams(&mut pts, table);
         }
 
         // 3. Tokenize each text split with the model.
@@ -920,7 +925,6 @@ impl Tokenizer {
         }
     }
 }
-
 
 /// Split each text chunk at unbridgeable byte-pair boundaries using the
 /// vocab-derived bigram bridge table.

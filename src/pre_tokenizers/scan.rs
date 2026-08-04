@@ -173,14 +173,25 @@ fn ascii_lower_run_end(b: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-/// Split `bytes` into up to `n_chunks` `(start, end)` segments, each boundary
-/// placed immediately after a maximal `\r`/`\n` run — which is always a
-/// pretoken boundary, so segments can be scanned/tokenized independently.
-pub(crate) fn newline_chunk_bounds(bytes: &[u8], n_chunks: usize) -> Vec<(usize, usize)> {
+/// Split `text` into up to `n_chunks` `(start, end)` byte segments, each split
+/// placed at a pretoken boundary so segments can be scanned/tokenized
+/// independently.
+///
+/// The split goes right after the **last** `\r`/`\n` of the maximal whitespace
+/// run around the nominal split point — the point where the pretoken containing
+/// that newline ends. `\s*[\r\n]+` matches a whitespace run up to and including
+/// its last newline, so the run may hold *interior* whitespace between newlines
+/// (`\n  \n` is a single pretoken: `\s*` eats `\n  `, `[\r\n]+` the last `\n`);
+/// a preceding `[^\s\p{L}\p{N}]+[\r\n]*` likewise ends at a newline. Splitting
+/// merely after the *first* newline run — as this once did — can fall inside
+/// such a pretoken and split it across two chunks, changing the tokenization.
+pub(crate) fn newline_chunk_bounds(text: &str, n_chunks: usize) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
     let n = bytes.len();
     if n_chunks < 2 {
         return vec![(0, n)];
     }
+    let t = tables();
     let nominal = n / n_chunks;
     let mut splits = vec![0usize];
     for i in 1..n_chunks {
@@ -188,12 +199,23 @@ pub(crate) fn newline_chunk_bounds(bytes: &[u8], n_chunks: usize) -> Vec<(usize,
         let Some(rel) = memchr::memchr2(b'\n', b'\r', &bytes[from..]) else {
             break;
         };
-        let mut p = from + rel;
-        while p < n && (bytes[p] == b'\n' || bytes[p] == b'\r') {
-            p += 1;
+        // Walk the maximal whitespace run (ASCII + Unicode) containing this
+        // newline, tracking the last `\r`/`\n`; the pretoken ends right after it.
+        let mut e = from + rel;
+        let mut last_nl = e;
+        while e < n {
+            let (c, l) = char_at(text, bytes, e);
+            if !is_ws(t, c) {
+                break;
+            }
+            if bytes[e] == b'\n' || bytes[e] == b'\r' {
+                last_nl = e;
+            }
+            e += l;
         }
-        if p < n && p > *splits.last().unwrap() {
-            splits.push(p);
+        let boundary = last_nl + 1;
+        if boundary < n && boundary > *splits.last().unwrap() {
+            splits.push(boundary);
         }
     }
     splits.push(n);
@@ -439,6 +461,30 @@ mod tests {
             .collect()
     }
 
+    /// Scanning a buffer split into [`newline_chunk_bounds`] segments must yield
+    /// exactly the same pretokens as scanning it whole — even when a nominal
+    /// split lands inside a `\s*[\r\n]+` pretoken that holds interior whitespace
+    /// (`" \n  \n"` is one pretoken). Regression for a chunk boundary placed
+    /// after the *first* newline run splitting such a pretoken across chunks.
+    #[test]
+    fn chunk_bounds_preserve_interior_newline_pretokens() {
+        // Sized so the 2-way nominal split (byte 100) is the run's start.
+        let text = format!("{} \n  \n{}", "a".repeat(100), "b".repeat(95));
+        let whole = scan(ScanKind::Kimi, &text);
+        assert!(
+            whole.iter().any(|p| p == " \n  \n"),
+            "run should be one pretoken: {whole:?}"
+        );
+
+        let bounds = newline_chunk_bounds(&text, 2);
+        assert!(bounds.len() >= 2, "expected a split: {bounds:?}");
+        let chunked: Vec<String> = bounds
+            .iter()
+            .flat_map(|&(s, e)| scan(ScanKind::Kimi, &text[s..e]))
+            .collect();
+        assert_eq!(chunked, whole, "chunked scan diverged from whole scan");
+    }
+
     #[test]
     fn words_case_split() {
         assert_eq!(scan(ScanKind::O200k, "HTTPRequest"), vec!["HTTPRequest"]);
@@ -497,14 +543,17 @@ mod tests {
     /// count. Guards the "newline runs are always pretoken boundaries" invariant.
     #[test]
     fn newline_chunking_matches_whole() {
-        let unit =
-            "Hello world!\nCamelCase 中文 test\n\n  spaced  lines\r\ncafé résumé 12345 don't\n";
+        // Includes `" \n  \n"` and `" \n \t\n"`: `\s*[\r\n]+` pretokens with
+        // interior whitespace between newlines, where a split after the first
+        // newline run would fall inside the pretoken.
+        let unit = "Hello world!\nCamelCase 中文 test\n\n  spaced  lines \n  \n\
+                    café résumé 12345 don't \n \t\n更多文本\r\n";
         let big = unit.repeat(400);
         for kind in [ScanKind::O200k, ScanKind::Kimi] {
             let whole = scan_seq(kind, &big);
             for n_chunks in [1usize, 2, 3, 7, 16, 64] {
                 let mut combined = Vec::new();
-                for (s, e) in newline_chunk_bounds(big.as_bytes(), n_chunks) {
+                for (s, e) in newline_chunk_bounds(&big, n_chunks) {
                     let base = s as u32;
                     for (a, b) in scan_seq(kind, &big[s..e]) {
                         combined.push((a + base, b + base));

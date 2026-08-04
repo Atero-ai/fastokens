@@ -273,7 +273,7 @@ where
     }
 
     let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
-    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(bytes, n_chunks);
+    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks);
     if segments.len() <= 1 {
         return per_chunk(buffer);
     }
@@ -315,7 +315,7 @@ where
     }
 
     let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
-    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(bytes, n_chunks);
+    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks);
     if segments.len() <= 1 {
         return per_chunk(buffer);
     }

@@ -23,23 +23,11 @@ pub enum ScanKind {
     Kimi,
 }
 
-/// The exact Kimi (`tokenization_kimi.py`) `pat_str`.
-pub(crate) const KIMI_PATTERN: &str = concat!(
-    r"[\p{Han}]+",
-    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
-    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
-    r"|\p{N}{1,3}",
-    r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
-    r"|\s*[\r\n]+",
-    r"|\s+(?!\S)",
-    r"|\s+",
-);
-
 /// Recognize a Split regex source as a scanner-supported pattern family.
 pub(crate) fn recognize(source: &str) -> Option<ScanKind> {
     if source == crate::tiktoken::O200K_BASE_PATTERN {
         Some(ScanKind::O200k)
-    } else if source == KIMI_PATTERN {
+    } else if source == crate::tiktoken::KIMI_PATTERN {
         Some(ScanKind::Kimi)
     } else {
         None
@@ -442,6 +430,7 @@ fn scan_seq(kind: ScanKind, text: &str) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiktoken::KIMI_PATTERN;
 
     fn scan(kind: ScanKind, text: &str) -> Vec<String> {
         scan_seq(kind, text)

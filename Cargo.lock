@@ -492,6 +492,7 @@ dependencies = [
  "strum",
  "thiserror",
  "tokenizers",
+ "ureq",
 ]
 
 [[package]]

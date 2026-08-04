@@ -88,34 +88,57 @@ tokens = tokenizer.encode("A very long prompt that is now lightning fast.")
 model files (`tiktoken.model`, or OpenAI's `.tiktoken` files) in addition to
 `tokenizer.json`.
 
+Hub repositories that ship a bare `tiktoken.model` instead of a
+`tokenizer.json` — such as Moonshot's Kimi — need nothing special:
+`from_model` detects the layout and resolves the pattern and special tokens from
+the repository's `tokenizer_config.json`.
+
+```python
+from fastokens import Tokenizer
+
+tok = Tokenizer.from_model("moonshotai/Kimi-K2.6")
+tok.encode("Hello, world!").ids
+tok.token_to_id("<|im_end|>")   # 163586, as declared by the model
+```
+
+The same applies in Rust via `Tokenizer::from_model` /
+`from_model_with_token`.
+
+#### Loading from a file
+
 A tiktoken model file only contains the byte-level BPE ranks — the
 pre-tokenization regex (`pat_str`) and the special tokens live in companion
 code, so they are supplied separately. For OpenAI's standard encodings, pass
 `encoding=` to use the built-in defaults:
 
 ```python
-from fastokens import Tokenizer
-
 # cl100k_base (GPT-3.5 / GPT-4) or o200k_base (GPT-4o):
 tok = Tokenizer.from_tiktoken("cl100k_base.tiktoken", encoding="cl100k_base")
 tok.encode("Hello, world!").ids  # matches tiktoken's encode_ordinary
 ```
 
-For any other model that ships a `tiktoken.model` (e.g. Kimi-K2), pass the
-model's own pattern and special tokens explicitly:
+For a model whose pattern is not a known preset, pass it explicitly:
 
 ```python
 tok = Tokenizer.from_tiktoken(
     "tiktoken.model",
     pattern=r"...the model's pat_str...",
-    special_tokens={"<|im_end|>": 163842, "<|im_user|>": 163843},
+    special_tokens={"<|im_end|>": 163586, "<|im_user|>": 163587},
 )
 ```
 
 The same is available in Rust via `Tokenizer::from_tiktoken_file`,
 `from_tiktoken_str`, and `from_tiktoken_ranks`, with `TiktokenConfig::cl100k_base()`
-/ `o200k_base()` presets. Special tokens are treated like HuggingFace added
-tokens (split out before the model, skippable on decode).
+/ `o200k_base()` presets and `TiktokenConfig::kimi()`. Special tokens are treated
+like HuggingFace added tokens (split out before the model, skippable on decode);
+`from_tiktoken_ranks_with_added_tokens` takes fully-specified added tokens when
+per-token `lstrip` / `rstrip` / `special` flags matter.
+
+Kimi's special tokens are derived from the vocabulary size rather than being a
+fixed table: it reserves 256 ids after the mergeable ranks, names the ones its
+`tokenizer_config.json` declares, and fills the rest with
+`<|reserved_token_{id}|>`. `TiktokenConfig::kimi(num_ranks, named)` reproduces
+that, which is why Kimi is not a `from_preset` name — a name alone is not enough.
 
 For the `o200k` and Kimi pattern families, pre-tokenization uses a hand-written,
 parallelized Unicode scanner instead of a regex engine (its classification

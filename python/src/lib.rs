@@ -562,8 +562,17 @@ impl PyTokenizer {
         )
     }
 
-    /// Download `tokenizer.json` from HuggingFace Hub for the given model
-    /// (e.g. `"meta-llama/Llama-3.1-8B"`) and create a tokenizer with it.
+    /// Download a tokenizer from HuggingFace Hub for the given model (e.g.
+    /// `"meta-llama/Llama-3.1-8B"`) and create a tokenizer with it.
+    ///
+    /// Uses `tokenizer.json` when the repository has one. Repositories that
+    /// ship a bare `tiktoken.model` instead (e.g. Moonshot's Kimi) are resolved
+    /// through the tiktoken loader.
+    ///
+    /// The ``pcre2_*`` limits do not apply to a tiktoken model. Those patterns use
+    /// character-class intersection (``&&``), which PCRE2 cannot compile, so
+    /// pre-tokenization runs on ``fancy-regex`` and there is no PCRE2 matcher to
+    /// bound. They are accepted and ignored on that path rather than rejected.
     #[staticmethod]
     #[pyo3(signature = (model, pcre2_match_limit = None, pcre2_depth_limit = None, pcre2_heap_limit = None, pcre2_max_jit_stack_size = None))]
     fn from_model(
@@ -574,21 +583,51 @@ impl PyTokenizer {
         pcre2_max_jit_stack_size: Option<usize>,
         py: Python<'_>,
     ) -> PyResult<Self> {
+        let options = tokenizer_options(
+            pcre2_match_limit,
+            pcre2_depth_limit,
+            pcre2_heap_limit,
+            pcre2_max_jit_stack_size,
+        );
+
+        // `tokenizer.json` is fetched here rather than deferred to
+        // `Tokenizer::from_model_with_options` because the `post_processor`
+        // property needs the raw JSON *text* to round-trip through `str()`.
+        // `Tokenizer::post_processor()` does expose the parsed value, but not the
+        // source it was built from. Only a genuinely absent file falls through —
+        // a transport or auth failure must propagate.
         let json = py
-            .allow_threads(|| {
-                fastokens::Tokenizer::download_tokenizer_json(model).map_err(|e| e.to_string())
-            })
+            .allow_threads(
+                || match fastokens::Tokenizer::download_tokenizer_json(model) {
+                    Ok(json) => Ok(Some(json)),
+                    Err(e) if e.is_not_found() => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                },
+            )
             .map_err(PyValueError::new_err)?;
-        Self::build_from_str(
-            &json,
-            py,
-            tokenizer_options(
-                pcre2_match_limit,
-                pcre2_depth_limit,
-                pcre2_heap_limit,
-                pcre2_max_jit_stack_size,
-            ),
-        )
+
+        let Some(json) = json else {
+            // No `tokenizer.json`: let the Rust loader resolve the repository as
+            // a tiktoken model. It re-probes `tokenizer.json` (one extra 404 on
+            // this path only) in exchange for keeping the common path untouched.
+            // A tiktoken pipeline has no post-processor, so nothing is lost.
+            let inner = py
+                .allow_threads(|| {
+                    fastokens::Tokenizer::from_model_with_options(model, options)
+                        .map_err(|e| e.to_string())
+                })
+                .map_err(PyValueError::new_err)?;
+            return Ok(Self {
+                state: RwLock::new(TokenizerState {
+                    inner,
+                    trunc: None,
+                    pad: None,
+                    post_processor_json: None,
+                }),
+            });
+        };
+
+        Self::build_from_str(&json, py, options)
     }
 
     /// Create a tokenizer from a tiktoken model file (e.g. `tiktoken.model`,

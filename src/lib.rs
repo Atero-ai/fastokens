@@ -927,10 +927,30 @@ impl Tokenizer {
         self.model.token_to_id(token)
     }
 
-    /// Return the vocabulary size (model tokens + added tokens).
+    /// Return the vocabulary size.
+    ///
+    /// A vocabulary is a token -> ID map, so its size is the number of *distinct
+    /// token strings*, which is how HuggingFace `tokenizers` computes it
+    /// (`get_vocab_size(true) == get_vocab(true).len()`). Adding the two counts
+    /// instead overcounts whenever `added_tokens` restates a string that is
+    /// already present, in either of two ways:
+    ///
+    /// - the string is also in `model.vocab` (e.g. a checkpoint that lists
+    ///   BOS/EOS/PAD in both places), or
+    /// - two `added_tokens` entries share a content under different IDs.
+    ///
+    /// Both collapse in a real vocabulary, so both are deduplicated here:
+    /// [`AddedTokens::contents`] yields distinct strings, and the model lookup
+    /// drops the ones the model already provides. Overcounting is not cosmetic —
+    /// callers size embedding tables from this and index every ID below it, so an
+    /// inflated count points at IDs that do not exist.
     pub fn vocab_size(&self) -> usize {
         let model_size = self.model.vocab_size();
-        let added_size = self.added_tokens.as_ref().map_or(0, |at| at.len());
+        let added_size = self.added_tokens.as_ref().map_or(0, |at| {
+            at.contents()
+                .filter(|content| self.model.token_to_id(content).is_none())
+                .count()
+        });
         model_size + added_size
     }
 
@@ -1212,6 +1232,120 @@ mod local_tests {
             err.to_string().contains("match limit"),
             "expected match limit error, got {err}"
         );
+    }
+
+    fn vocab_size_of(model_vocab: Value, added_tokens: Value) -> usize {
+        Tokenizer::from_json(json!({
+            "model": {"type": "BPE", "vocab": model_vocab, "merges": []},
+            "added_tokens": added_tokens,
+        }))
+        .unwrap()
+        .vocab_size()
+    }
+
+    /// Every way `added_tokens` can overlap an existing vocabulary entry.
+    ///
+    /// Expectations are the values HuggingFace `tokenizers` reports from
+    /// `get_vocab_size(true)` for the same `tokenizer.json`, since a vocabulary
+    /// counts distinct token strings.
+    #[test]
+    fn vocab_size_matches_huggingface_across_added_token_overlaps() {
+        // No overlap: every added token is new.
+        assert_eq!(
+            vocab_size_of(
+                json!({"a": 0, "b": 1}),
+                json!([{"id": 2, "content": "<x>"}, {"id": 3, "content": "<y>"}]),
+            ),
+            4
+        );
+
+        // Added tokens restate strings the model already has. Seen in the wild on
+        // checkpoints that list BOS/EOS/PAD in both `model.vocab` and
+        // `added_tokens`.
+        assert_eq!(
+            vocab_size_of(
+                json!({"<bos>": 0, "<eos>": 1, "a": 2, "b": 3}),
+                json!([
+                    {"id": 0, "content": "<bos>", "special": true},
+                    {"id": 1, "content": "<eos>", "special": true},
+                    {"id": 4, "content": "<extra>"}
+                ]),
+            ),
+            5
+        );
+
+        // A gap between the model vocab and the added IDs does not inflate the
+        // count: the size follows the strings, not the highest ID.
+        assert_eq!(
+            vocab_size_of(
+                json!({"a": 0, "b": 1}),
+                json!([{"id": 5, "content": "<far>"}])
+            ),
+            3
+        );
+
+        // A new string at an ID inside the model range still adds one entry.
+        assert_eq!(
+            vocab_size_of(
+                json!({"a": 0, "b": 1, "c": 2}),
+                json!([{"id": 1, "content": "<inside>"}]),
+            ),
+            4
+        );
+    }
+
+    /// Two `added_tokens` entries sharing a content are rejected when the
+    /// matcher is built, so the count never sees that overlap. Recorded because
+    /// it is the reason the vocabulary count only has to deduplicate added
+    /// strings against the *model*, and because HuggingFace `tokenizers` accepts
+    /// such a file (reporting one entry for the shared string) — a separate
+    /// divergence, and the safer direction of the two.
+    #[test]
+    fn duplicate_added_token_contents_are_rejected_at_construction() {
+        // Tokenizer has no Debug impl, so unwrap_err() is unavailable.
+        let result = Tokenizer::from_json(json!({
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+            "added_tokens": [
+                {"id": 2, "content": "<dup>"},
+                {"id": 3, "content": "<dup>"}
+            ],
+        }));
+        let err = match result {
+            Ok(_) => panic!("expected duplicate added-token contents to be rejected"),
+            Err(e) => e,
+        };
+
+        assert!(
+            err.to_string().contains("DuplicatePattern"),
+            "expected a duplicate-pattern error, got {err}"
+        );
+    }
+
+    /// The count must not claim IDs that cannot be resolved, which is the
+    /// property callers rely on when they size an embedding table from it and
+    /// then index every ID below it.
+    #[test]
+    fn vocab_size_only_counts_resolvable_ids() {
+        let tokenizer = Tokenizer::from_json(json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<bos>": 0, "<eos>": 1, "a": 2, "b": 3},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 0, "content": "<bos>", "special": true},
+                {"id": 1, "content": "<eos>", "special": true},
+                {"id": 4, "content": "<extra>"}
+            ]
+        }))
+        .unwrap();
+
+        for id in 0..tokenizer.vocab_size() as u32 {
+            assert!(
+                tokenizer.id_to_token(id).is_some(),
+                "id {id} is counted but has no token"
+            );
+        }
     }
 }
 

@@ -131,6 +131,16 @@ impl AddedTokens {
         self.content_to_id.get(token).copied()
     }
 
+    /// Iterate the distinct content strings of the added tokens.
+    ///
+    /// Unlike [`Self::iter`], which yields one entry per ID, this yields one
+    /// entry per string: two added tokens sharing a content collapse to one.
+    /// That is the granularity a vocabulary count needs, since a vocabulary is a
+    /// token -> ID map and cannot hold the same string twice.
+    pub fn contents(&self) -> impl Iterator<Item = &str> {
+        self.content_to_id.keys().map(String::as_str)
+    }
+
     /// Check if a token ID is a special added token.
     pub fn is_special(&self, id: u32) -> bool {
         self.special_ids.contains(&id)

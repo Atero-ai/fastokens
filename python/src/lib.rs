@@ -815,6 +815,35 @@ impl PyTokenizer {
         Py::new(py, state.build_single_encoding(ids))
     }
 
+    /// Encode a pre-segmented input, concatenating each segment's token ids.
+    ///
+    /// `segments` is a list of `(text, allow_special)` pairs. Each segment is
+    /// tokenized independently; special/added tokens are recognized only in
+    /// segments with `allow_special=True` (trusted chat-template output), so a
+    /// literal control token in an `allow_special=False` segment stays ordinary
+    /// content. Mirrors legacy tiktoken / Dynamo segmented encoding. No
+    /// post-processor special tokens are inserted. Truncation and padding (if
+    /// enabled) are applied to the concatenated result before returning.
+    fn encode_segments(
+        &self,
+        segments: Vec<(String, bool)>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyEncoding>> {
+        let state = self.read();
+        let segs: Vec<fastokens::EncodeSegment<'_>> = segments
+            .iter()
+            .map(|(text, allow_special)| fastokens::EncodeSegment {
+                text: text.as_str(),
+                allow_special: *allow_special,
+            })
+            .collect();
+        let ids = state
+            .inner
+            .encode_segments(&segs)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Py::new(py, state.build_single_encoding(ids))
+    }
+
     /// Encode a batch of inputs in parallel.
     ///
     /// Truncation is applied per-sequence; padding (if enabled) pads the

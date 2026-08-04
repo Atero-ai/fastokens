@@ -315,6 +315,39 @@ pub struct TokenizerOptions {
     pub pcre2_limits: Pcre2Limits,
 }
 
+/// One piece of input for [`Tokenizer::encode_segments`].
+///
+/// A segment carries its own trust boundary: when `allow_special` is `true`,
+/// added/special vocabulary entries (e.g. `<|im_end|>`) in `text` are
+/// recognized as control tokens — appropriate for trusted chat-template output.
+/// When `false`, `text` is encoded as ordinary content, so a literal
+/// `<|im_end|>` becomes plain tokens and cannot be injected by untrusted input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeSegment<'a> {
+    /// The text of this segment.
+    pub text: &'a str,
+    /// Whether special/added tokens are recognized within `text`.
+    pub allow_special: bool,
+}
+
+impl<'a> EncodeSegment<'a> {
+    /// A trusted segment whose special tokens are recognized.
+    pub fn special(text: &'a str) -> Self {
+        Self {
+            text,
+            allow_special: true,
+        }
+    }
+
+    /// An untrusted segment encoded as ordinary content.
+    pub fn ordinary(text: &'a str) -> Self {
+        Self {
+            text,
+            allow_special: false,
+        }
+    }
+}
+
 /// An LLM tokenizer backed by `tokenizer.json`.
 pub struct Tokenizer {
     added_tokens: Option<AddedTokens>,
@@ -697,6 +730,36 @@ impl Tokenizer {
     /// post-processing are preserved.
     pub fn encode_ordinary(&self, input: &str) -> Result<Vec<u32>, Error> {
         self.encode_inner(input, false, false)
+    }
+
+    /// Encode a pre-segmented input, concatenating the token ids of each
+    /// segment in order.
+    ///
+    /// This mirrors legacy tiktoken / Dynamo segmented encoding: each
+    /// [`EncodeSegment`] is tokenized **independently** and its trust boundary
+    /// is honored — special tokens are recognized only in segments with
+    /// `allow_special = true` (see [`EncodeSegment`]). Segments are never
+    /// flattened into a single string first, so the trust boundary between
+    /// control tokens and untrusted content is preserved, and no BPE merge
+    /// crosses a segment boundary.
+    ///
+    /// No post-processor special tokens (BOS/EOS) are inserted — the caller's
+    /// segments are expected to already carry the full rendered sequence.
+    pub fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>, Error> {
+        // Single-segment shortcut avoids a second allocation + copy.
+        if let [seg] = segments {
+            return self.encode_inner(seg.text, false, seg.allow_special);
+        }
+        let mut ids = Vec::new();
+        for seg in segments {
+            let seg_ids = self.encode_inner(seg.text, false, seg.allow_special)?;
+            if ids.is_empty() {
+                ids = seg_ids;
+            } else {
+                ids.extend_from_slice(&seg_ids);
+            }
+        }
+        Ok(ids)
     }
 
     fn encode_inner(
@@ -1826,6 +1889,50 @@ mod tests {
             // Round-trip: the ID must decode back to the same string.
             assert_eq!(tok.id_to_token(id.unwrap()), Some(*token));
         }
+    }
+
+    /// `encode_segments` honors the per-segment trust boundary and concatenates
+    /// each segment's ids without flattening or crossing BPE boundaries.
+    #[test]
+    fn encode_segments_honors_trust_boundary() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        let special = "<|im_start|>";
+
+        // Trusted segment: the control token is recognized as a single id.
+        let trusted = tok
+            .encode_segments(&[EncodeSegment::special(special)])
+            .unwrap();
+        assert_eq!(trusted, tok.encode(special).unwrap());
+        assert_eq!(trusted.len(), 1, "control token should be one id");
+
+        // Untrusted segment: the same text is encoded as ordinary content and
+        // must NOT collapse to the special id.
+        let untrusted = tok
+            .encode_segments(&[EncodeSegment::ordinary(special)])
+            .unwrap();
+        assert_eq!(untrusted, tok.encode_ordinary(special).unwrap());
+        assert_ne!(untrusted, trusted);
+
+        // Mixed segments concatenate independently: a literal control token in
+        // the untrusted content segment stays ordinary.
+        let content = "hello <|im_start|> world";
+        let got = tok
+            .encode_segments(&[
+                EncodeSegment::special(special),
+                EncodeSegment::ordinary(content),
+            ])
+            .unwrap();
+        let mut want = tok.encode(special).unwrap();
+        want.extend(tok.encode_ordinary(content).unwrap());
+        assert_eq!(got, want);
+
+        // Empty input yields no tokens.
+        assert!(tok.encode_segments(&[]).unwrap().is_empty());
+        assert!(
+            tok.encode_segments(&[EncodeSegment::ordinary("")])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // Qwen2-VL's image token is located in the tokenizer_config.json's added_token_configs

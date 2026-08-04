@@ -148,6 +148,43 @@ pub enum Error {
     InvalidIdentifier(String),
 }
 
+impl Error {
+    /// Whether this error means "the requested file does not exist", as opposed
+    /// to a transport, auth, or parse failure.
+    ///
+    /// This distinction is load-bearing for callers that probe for an optional
+    /// file: a missing file is a permanent, expected outcome to be handled (try
+    /// another format), whereas a network or credential failure is transient and
+    /// must be propagated and retried. Conflating the two makes a permanent 404
+    /// look retryable forever.
+    ///
+    /// Recognizes an HTTP 404 from the Hub, and a local
+    /// [`std::io::ErrorKind::NotFound`]. (`hf-hub` has no offline mode — a cache
+    /// miss is a `None` from the cache lookup, not an error.)
+    ///
+    /// The `Io` arm is unreachable from the Rust resolver, where `ApiRepo::get`
+    /// yields an `ApiError` and a failed read propagates on its own. It is live
+    /// for the Python layer, which classifies `download_tokenizer_json` — a `get`
+    /// followed by a `read_to_string` — so a file pruned from the cache between
+    /// those two steps is retried through the resolver instead of failing.
+    ///
+    /// Only the un-nested `RequestError(Status(404, _))` shape is matched, which
+    /// is what a missing remote file produces: the metadata `HEAD` raises before
+    /// the body phase, and `max_retries` defaults to 0 so nothing wraps it in
+    /// `TooManyRetries`. Enabling retries would need this widened.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            #[cfg(feature = "hf-hub")]
+            Self::Hub(hf_hub_support::ApiError::RequestError(e)) => {
+                matches!(e.as_ref(), ureq::Error::Status(404, _))
+            }
+            Self::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+}
+
 /// Don't attempt prefix reuse unless the shared prefix is at least this many
 /// bytes — below it, tokenizing from scratch is already cheap and the LCP scan
 /// plus bookkeeping isn't worth it.
@@ -1182,6 +1219,27 @@ mod local_tests {
 
     use super::*;
 
+    // ── Error::is_not_found, feature-independent arms ───────────────────────
+    //
+    // These live here rather than in `mod tests` because that module is gated on
+    // `feature = "hf-hub"`. Without it the `Hub` arm is compiled out and `Io` is
+    // the only live arm, so gating its tests would leave the one reachable branch
+    // untested in exactly the build where it matters.
+
+    #[test]
+    fn is_not_found_detects_io_not_found() {
+        let err = Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(err.is_not_found());
+    }
+
+    #[test]
+    fn is_not_found_rejects_other_io_and_error_kinds() {
+        let denied = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!denied.is_not_found());
+        assert!(!Error::Model("boom".into()).is_not_found());
+        assert!(!Error::Tiktoken("boom".into()).is_not_found());
+    }
+
     #[test]
     fn from_json_with_options_propagates_pcre2_limits() {
         let tokenizer = Tokenizer::from_json_with_options(
@@ -1220,6 +1278,31 @@ mod tests {
     use crate::hf_hub_support::make_api;
 
     use super::*;
+
+    // ── Error::is_not_found, Hub arm ────────────────────────────────────────
+
+    #[test]
+    fn is_not_found_detects_http_404() {
+        let response = ureq::Response::new(404, "Not Found", "").unwrap();
+        let err = Error::Hub(hf_hub_support::ApiError::RequestError(Box::new(
+            ureq::Error::Status(404, response),
+        )));
+        assert!(err.is_not_found(), "404 must be reported as not-found");
+    }
+
+    /// A 403 (no access / bad credentials) must NOT read as not-found — it is
+    /// retryable once the token is fixed, and misclassifying it would make the
+    /// caller silently fall through to a different format.
+    #[test]
+    fn is_not_found_rejects_other_http_statuses() {
+        for status in [401, 403, 429, 500, 503] {
+            let response = ureq::Response::new(status, "Err", "").unwrap();
+            let err = Error::Hub(hf_hub_support::ApiError::RequestError(Box::new(
+                ureq::Error::Status(status, response),
+            )));
+            assert!(!err.is_not_found(), "{status} must not be not-found");
+        }
+    }
 
     const HF_MODELS: &[&str] = &[
         "Qwen/Qwen3-0.6B",

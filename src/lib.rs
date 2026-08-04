@@ -29,7 +29,10 @@ pub use self::{
     normalizers::{Nfc, Normalizer, Replace},
     post_processors::PostProcessor,
     pre_tokenizers::{ByteLevel, Pcre2Limits, PreTokenizer, Split, SplitBehavior},
-    tiktoken::{CL100K_BASE_PATTERN, O200K_BASE_PATTERN, TiktokenConfig},
+    tiktoken::{
+        CL100K_BASE_PATTERN, KIMI_PATTERN, KIMI_RESERVED_SPECIAL_TOKENS, O200K_BASE_PATTERN,
+        TiktokenConfig, TiktokenFamily,
+    },
 };
 
 use self::{
@@ -490,30 +493,15 @@ impl Tokenizer {
     /// pre-tokenization regex and special tokens are supplied via `config`
     /// (see [`TiktokenConfig`]). The resulting pipeline is: split special
     /// tokens → split on the regex → fused byte-level BPE → ByteLevel decode.
+    ///
+    /// Each special token becomes a literal (unnormalized, non-stripping) added
+    /// token marked special. To carry per-token `lstrip` / `rstrip` / `special`
+    /// flags through instead — as declared in a model's `added_tokens_decoder` —
+    /// use [`Self::from_tiktoken_ranks_with_added_tokens`].
     pub fn from_tiktoken_ranks(
         ranks: &[(Vec<u8>, u32)],
         config: TiktokenConfig,
     ) -> Result<Self, Error> {
-        let bpe = models::bpe::Bpe::from_tiktoken_ranks(ranks).map_err(Error::Model)?;
-        let model = Model::Bpe(bpe);
-
-        // Sequence([Split(pat_str, Isolated), ByteLevel(bulk)]) — the shape the
-        // fused byte-level path is detected from. The Split reproduces
-        // tiktoken's `regex.findall`; ByteLevel(bulk) marks byte-level BPE.
-        let split = Split::from_config(
-            &serde_json::json!({ "Regex": config.pattern }),
-            "Isolated",
-            false,
-        )?;
-        let byte_level = ByteLevel::from_config(false, false, false)?;
-        let pre_tokenizer = Some(PreTokenizer::Sequence(vec![
-            PreTokenizer::Split(split),
-            PreTokenizer::ByteLevel(byte_level),
-        ]));
-        let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
-
-        // Special tokens become literal (unnormalized) added tokens, matched
-        // before the model and marked special so decode can skip them.
         let added_configs: Vec<AddedTokenConfig> = config
             .special_tokens
             .into_iter()
@@ -527,7 +515,47 @@ impl Tokenizer {
                 special: true,
             })
             .collect();
-        let added_tokens = AddedTokens::from_configs(&added_configs).map_err(Error::Model)?;
+        Self::from_tiktoken_ranks_with_added_tokens(ranks, &config.pattern, &added_configs)
+    }
+
+    /// Like [`Self::from_tiktoken_ranks`], but takes fully-specified added
+    /// tokens instead of `(content, id)` pairs.
+    ///
+    /// Use this when the model declares per-token flags — typically via
+    /// `tokenizer_config.json`'s `added_tokens_decoder`, which
+    /// [`TokenizerConfig::added_token_configs`] converts. The flags are not
+    /// cosmetic: `lstrip` / `rstrip` make a match absorb adjacent whitespace and
+    /// so change the resulting token ids, while `special` controls whether
+    /// decoding can skip the token.
+    ///
+    /// Takes no [`TokenizerOptions`] because its only member, the PCRE2 limits,
+    /// cannot apply here: Kimi-family patterns use character-class intersection
+    /// (`&&`), which PCRE2 cannot compile, so pre-tokenization runs on
+    /// `fancy-regex` and there is no PCRE2 matcher to bound. Threading limits in
+    /// would make `Split` reject the pattern outright
+    /// (`try_compile_pcre2_regexes` returns `Unsupported` when limits are set on
+    /// an intersection pattern), turning an inert knob into a load failure.
+    pub fn from_tiktoken_ranks_with_added_tokens(
+        ranks: &[(Vec<u8>, u32)],
+        pattern: &str,
+        added_configs: &[AddedTokenConfig],
+    ) -> Result<Self, Error> {
+        let bpe = models::bpe::Bpe::from_tiktoken_ranks(ranks).map_err(Error::Model)?;
+        let model = Model::Bpe(bpe);
+
+        // Sequence([Split(pat_str, Isolated), ByteLevel(bulk)]) — the shape the
+        // fused byte-level path is detected from. The Split reproduces
+        // tiktoken's `regex.findall`; ByteLevel(bulk) marks byte-level BPE.
+        let split =
+            Split::from_config(&serde_json::json!({ "Regex": pattern }), "Isolated", false)?;
+        let byte_level = ByteLevel::from_config(false, false, false)?;
+        let pre_tokenizer = Some(PreTokenizer::Sequence(vec![
+            PreTokenizer::Split(split),
+            PreTokenizer::ByteLevel(byte_level),
+        ]));
+        let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
+
+        let added_tokens = AddedTokens::from_configs(added_configs).map_err(Error::Model)?;
 
         let decoder = Some(Decoder::from_config(DecoderConfig::ByteLevel)?);
 

@@ -22,6 +22,8 @@
 //! ranks. The resulting [`Tokenizer`](crate::Tokenizer) runs on the existing
 //! fused byte-level BPE path.
 
+use std::collections::HashMap;
+
 use crate::Error;
 
 /// The pre-tokenization regex used by OpenAI's `cl100k_base` encoding
@@ -51,13 +53,72 @@ pub const O200K_BASE_PATTERN: &str = concat!(
     r"|\s+",
 );
 
+/// The pre-tokenization regex used by Moonshot's Kimi models (K2 and later),
+/// verbatim from the `pat_str` in the `tokenization_kimi.py` they ship.
+///
+/// It differs from [`O200K_BASE_PATTERN`] in two ways: a leading `[\p{Han}]+`
+/// alternative makes Han runs their own pretokens (with Han then excluded from
+/// the letter classes via `&&[^\p{Han}]`), and the trailing class of a
+/// punctuation run is `[\r\n]*` rather than o200k's `[\r\n/]*`, so o200k also
+/// absorbs a `/` there. Note `/` itself is matched by `[^\s\p{L}\p{N}]+` under
+/// both patterns; only the trailing position differs.
+///
+/// This must stay **byte-identical** to the model's own `pat_str`:
+/// [`crate::pre_tokenizers::scan`] recognizes the scanner fast path by exact
+/// string comparison, so any drift silently falls back to the regex engine.
+pub const KIMI_PATTERN: &str = concat!(
+    r"[\p{Han}]+",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"|\p{N}{1,3}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
+/// Number of consecutive ids Kimi reserves for special tokens, starting at the
+/// end of the mergeable ranks (`num_reserved_special_tokens` in
+/// `tokenization_kimi.py`).
+pub const KIMI_RESERVED_SPECIAL_TOKENS: u32 = 256;
+
+/// A recognized family of tiktoken-based model repository.
+///
+/// A `tiktoken.model` file carries only mergeable ranks, so loading one from a
+/// model repository requires knowing which pre-tokenization pattern and
+/// special-token layout it belongs to. That cannot be read from the ranks file;
+/// it is inferred from `tokenizer_config.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TiktokenFamily {
+    /// Moonshot Kimi (K2 and later). See [`TiktokenConfig::kimi`].
+    Kimi,
+}
+
+impl TiktokenFamily {
+    /// Infer the family from a `tokenizer_config.json`.
+    ///
+    /// `tokenizer_class` alone is not sufficient: Kimi declares the generic
+    /// `"TikTokenTokenizer"`, which another vendor could reuse with a different
+    /// pattern. The discriminator is the module in `auto_map.AutoTokenizer`,
+    /// which for Kimi names its own `tokenization_kimi` (as in
+    /// `"tokenization_kimi.TikTokenTokenizer"`).
+    #[must_use]
+    pub fn detect(tokenizer_class: Option<&str>, auto_map_tokenizer: Option<&str>) -> Option<Self> {
+        let module = auto_map_tokenizer?.split('.').next()?;
+        match (module, tokenizer_class) {
+            ("tokenization_kimi", Some("TikTokenTokenizer")) => Some(Self::Kimi),
+            _ => None,
+        }
+    }
+}
+
 /// Everything needed to turn a set of mergeable ranks into a working
 /// tokenizer: the pre-tokenization regex and the special tokens.
 ///
 /// Use [`TiktokenConfig::cl100k_base`] / [`TiktokenConfig::o200k_base`] for the
-/// standard OpenAI encodings, or [`TiktokenConfig::new`] to supply a custom
-/// pattern and special-token table (e.g. when loading a model's own
-/// `tiktoken.model`).
+/// standard OpenAI encodings, [`TiktokenConfig::kimi`] for Kimi models, or
+/// [`TiktokenConfig::new`] to supply a custom pattern and special-token table
+/// (e.g. when loading a model's own `tiktoken.model`).
 #[derive(Clone, Debug)]
 pub struct TiktokenConfig {
     /// The pre-tokenization regex (`pat_str`). Applied with `Isolated`
@@ -103,7 +164,49 @@ impl TiktokenConfig {
         )
     }
 
+    /// Config for Moonshot's Kimi models (K2 and later).
+    ///
+    /// Unlike the OpenAI encodings, Kimi's special-token table is not a fixed
+    /// list: it is derived from the vocabulary size. Kimi reserves
+    /// [`KIMI_RESERVED_SPECIAL_TOKENS`] ids immediately after the mergeable
+    /// ranks, names the ones its `tokenizer_config.json` declares, and fills the
+    /// remainder with `<|reserved_token_{id}|>` placeholders. This reproduces
+    /// `tokenization_kimi.py` exactly:
+    ///
+    /// ```text
+    /// special_tokens_mapping.get(i, f"<|reserved_token_{i}|>"): i
+    /// for i in range(num_base_tokens, num_base_tokens + num_reserved_special_tokens)
+    /// ```
+    ///
+    /// `num_ranks` is the number of mergeable ranks (i.e. the first reserved id).
+    /// `named` supplies the declared `(id, content)` pairs, normally taken from
+    /// `tokenizer_config.json`'s `added_tokens_decoder`.
+    ///
+    /// Entries in `named` whose id falls outside the reserved window are
+    /// **ignored**, matching the reference implementation — an id below
+    /// `num_ranks` denotes a regular BPE token, and registering it as a special
+    /// token would change tokenization.
+    pub fn kimi(num_ranks: u32, named: impl IntoIterator<Item = (u32, String)>) -> Self {
+        let end = num_ranks.saturating_add(KIMI_RESERVED_SPECIAL_TOKENS);
+        let mut names: HashMap<u32, String> = named
+            .into_iter()
+            .filter(|(id, _)| (num_ranks..end).contains(id))
+            .collect();
+        let mut special_tokens = Vec::with_capacity(KIMI_RESERVED_SPECIAL_TOKENS as usize);
+        for id in num_ranks..end {
+            let content = names
+                .remove(&id)
+                .unwrap_or_else(|| format!("<|reserved_token_{id}|>"));
+            special_tokens.push((content, id));
+        }
+        Self::new(KIMI_PATTERN, special_tokens)
+    }
+
     /// Resolve a preset config by name (`"cl100k_base"` or `"o200k_base"`).
+    ///
+    /// Kimi is deliberately absent: its special-token table depends on the
+    /// vocabulary size and the model's declared token names, so it cannot be
+    /// produced from a name alone. Use [`TiktokenConfig::kimi`] instead.
     pub fn from_preset(name: &str) -> Option<Self> {
         match name {
             "cl100k_base" | "cl100k" => Some(Self::cl100k_base()),
@@ -184,6 +287,96 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Kimi pattern / preset ───────────────────────────────────────────────
+
+    /// [`KIMI_PATTERN`] must stay byte-identical to the `pat_str` in the
+    /// `tokenization_kimi.py` Moonshot ships, because
+    /// [`crate::pre_tokenizers::scan::recognize`] matches it by exact string
+    /// comparison — any drift silently disables the scanner fast path instead of
+    /// failing. This literal is an independent transcription of that `pat_str`
+    /// (from `moonshotai/Kimi-K2.6`), so an accidental edit to the `concat!`
+    /// above fails here rather than degrading performance in silence.
+    #[test]
+    fn kimi_pattern_matches_the_model_pat_str() {
+        const KIMI_PAT_STR_FROM_MODEL: &str = r#"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#;
+        assert_eq!(KIMI_PATTERN, KIMI_PAT_STR_FROM_MODEL);
+    }
+
+    #[test]
+    fn kimi_config_fills_the_reserved_window() {
+        let config = TiktokenConfig::kimi(163_584, []);
+        assert_eq!(config.pattern, KIMI_PATTERN);
+        assert_eq!(config.special_tokens.len(), 256);
+        // Contiguous ids across the whole reserved window, all placeholders.
+        assert_eq!(
+            config.special_tokens.first().unwrap(),
+            &("<|reserved_token_163584|>".to_string(), 163_584)
+        );
+        assert_eq!(
+            config.special_tokens.last().unwrap(),
+            &("<|reserved_token_163839|>".to_string(), 163_839)
+        );
+        let ids: Vec<u32> = config.special_tokens.iter().map(|&(_, id)| id).collect();
+        assert_eq!(ids, (163_584..163_840).collect::<Vec<u32>>());
+    }
+
+    /// Declared names override the placeholder at their id; every other slot
+    /// keeps its placeholder. Mirrors Kimi-K2.6's real `added_tokens_decoder`.
+    #[test]
+    fn kimi_config_applies_declared_names() {
+        let config = TiktokenConfig::kimi(
+            163_584,
+            [
+                (163_584, "[BOS]".to_string()),
+                (163_586, "<|im_end|>".to_string()),
+                (163_839, "[PAD]".to_string()),
+            ],
+        );
+        assert_eq!(config.special_tokens.len(), 256);
+        let by_id: HashMap<u32, &str> = config
+            .special_tokens
+            .iter()
+            .map(|(content, id)| (*id, content.as_str()))
+            .collect();
+        assert_eq!(by_id[&163_584], "[BOS]");
+        assert_eq!(by_id[&163_586], "<|im_end|>");
+        assert_eq!(by_id[&163_839], "[PAD]");
+        // Undeclared slots keep placeholders.
+        assert_eq!(by_id[&163_585], "<|reserved_token_163585|>");
+        assert_eq!(by_id[&163_700], "<|reserved_token_163700|>");
+    }
+
+    /// Ids outside the reserved window are ignored: below `num_ranks` they name
+    /// regular BPE tokens, and promoting one to a special token would change
+    /// tokenization. Matches `tokenization_kimi.py`, which only ever looks up
+    /// ids inside the window.
+    #[test]
+    fn kimi_config_ignores_ids_outside_the_reserved_window() {
+        let config = TiktokenConfig::kimi(
+            163_584,
+            [
+                (5, "regular-bpe-token".to_string()),
+                (163_583, "last-rank".to_string()),
+                (163_840, "past-the-window".to_string()),
+                (999_999, "way-out".to_string()),
+            ],
+        );
+        assert_eq!(config.special_tokens.len(), 256);
+        assert!(
+            config
+                .special_tokens
+                .iter()
+                .all(|(content, _)| content.starts_with("<|reserved_token_")),
+            "out-of-window names must not leak into the table"
+        );
+    }
+
+    #[test]
+    fn kimi_is_absent_from_from_preset() {
+        // Cannot be derived from a name alone — needs the vocab size.
+        assert!(TiktokenConfig::from_preset("kimi").is_none());
+    }
 
     #[test]
     fn base64_roundtrip() {

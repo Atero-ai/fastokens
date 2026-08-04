@@ -63,6 +63,26 @@ impl TokenizerConfig {
         entries.sort_by_key(|entry| entry.id);
         Ok(entries)
     }
+
+    /// The declared `tokenizer_class`, if any (e.g. `"TikTokenTokenizer"`).
+    #[must_use]
+    pub fn tokenizer_class(&self) -> Option<&str> {
+        self.extra.get("tokenizer_class")?.as_str()
+    }
+
+    /// The implementing class named by `auto_map.AutoTokenizer`, if any.
+    ///
+    /// `auto_map.AutoTokenizer` is `[slow_class, fast_class]`; this returns the
+    /// slow (first) entry, e.g. `"tokenization_kimi.TikTokenTokenizer"`. Its
+    /// module prefix identifies which model family implements the tokenizer.
+    #[must_use]
+    pub fn auto_map_tokenizer(&self) -> Option<&str> {
+        self.extra
+            .get("auto_map")?
+            .get("AutoTokenizer")?
+            .get(0)?
+            .as_str()
+    }
 }
 
 /// Parsed `tokenizer.json`.

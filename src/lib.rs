@@ -45,9 +45,12 @@ use self::{
 mod hf_hub_support {
     pub use hf_hub::api::sync::ApiError;
 
-    use super::{Error, Tokenizer, TokenizerJson, TokenizerOptions};
-    use hf_hub::api::sync::{Api, ApiBuilder};
-    use std::fs;
+    use super::{
+        AddedTokenConfig, Error, KIMI_PATTERN, TiktokenConfig, TiktokenFamily, Tokenizer,
+        TokenizerConfig, TokenizerJson, TokenizerOptions, tiktoken::parse_tiktoken_model,
+    };
+    use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
+    use std::{collections::HashMap, fs};
 
     /// Build an `hf-hub` [`Api`] client, optionally overriding the token that
     /// would otherwise be read from the local HuggingFace credential cache
@@ -83,7 +86,28 @@ mod hf_hub_support {
         validate_model_id(model)?;
         let api = make_api(token)?;
         let repo = api.model(model.to_string());
-        let json_path = repo.get("tokenizer.json")?;
+
+        // `tokenizer.json` first: it is the common case, and `ApiRepo::get`
+        // short-circuits on the local cache, so a warm cache needs no network.
+        // Only a genuinely absent file falls through to the tiktoken layout —
+        // a transport or auth failure must propagate, not be misread as
+        // "this repo must be tiktoken".
+        let json_path = match repo.get("tokenizer.json") {
+            Ok(path) => path,
+            Err(e) => {
+                let json_err = Error::from(e);
+                if !json_err.is_not_found() {
+                    return Err(json_err);
+                }
+                // Report the missing `tokenizer.json` rather than the missing
+                // `tiktoken.model` when the repo is neither: for a repo that is
+                // simply misconfigured, that is the more useful error.
+                return match from_tiktoken_repo(&repo)? {
+                    Some(tokenizer) => Ok(tokenizer),
+                    None => Err(json_err),
+                };
+            }
+        };
         let raw = fs::read_to_string(&json_path)?;
         let json: TokenizerJson = serde_json::from_str(&raw)?;
         // Some models (e.g. Qwen2-VL) declare added tokens only in
@@ -103,6 +127,106 @@ mod hf_hub_support {
             None
         };
         Tokenizer::build_with_options(json, tokenizer_config, options)
+    }
+
+    /// Build a [`Tokenizer`] from a repository that ships a bare
+    /// `tiktoken.model` instead of a `tokenizer.json` (e.g. Moonshot's Kimi).
+    ///
+    /// Returns `Ok(None)` when the repo has no `tiktoken.model` either, leaving
+    /// it to the caller to report the absent `tokenizer.json`. A `tiktoken.model`
+    /// that is present but unusable is an error, not a `None` — silently
+    /// reporting "no tokenizer.json" would hide the real cause.
+    fn from_tiktoken_repo(repo: &ApiRepo) -> Result<Option<Tokenizer>, Error> {
+        let ranks_path = match repo.get("tiktoken.model") {
+            Ok(path) => path,
+            Err(e) => {
+                let err = Error::from(e);
+                if err.is_not_found() {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        };
+
+        // The ranks file carries no pattern or special tokens, so
+        // `tokenizer_config.json` is required to identify the family.
+        let config_path = ranks_path.with_file_name("tokenizer_config.json");
+        let config_raw = if config_path.exists() {
+            fs::read_to_string(config_path)?
+        } else {
+            fs::read_to_string(repo.get("tokenizer_config.json").map_err(|e| {
+                let err = Error::from(e);
+                if err.is_not_found() {
+                    Error::Tiktoken(
+                        "repository has tiktoken.model but no tokenizer_config.json, so the \
+                         pre-tokenization pattern cannot be determined"
+                            .into(),
+                    )
+                } else {
+                    err
+                }
+            })?)?
+        };
+        let config: TokenizerConfig = serde_json::from_str(&config_raw)?;
+
+        let family = TiktokenFamily::detect(config.tokenizer_class(), config.auto_map_tokenizer())
+            .ok_or_else(|| {
+                Error::Tiktoken(format!(
+                    "unrecognized tiktoken model family (tokenizer_class={:?}, \
+                     auto_map.AutoTokenizer={:?}); supply the pattern explicitly via \
+                     Tokenizer::from_tiktoken_file",
+                    config.tokenizer_class(),
+                    config.auto_map_tokenizer(),
+                ))
+            })?;
+
+        let ranks = parse_tiktoken_model(&fs::read_to_string(&ranks_path)?)?;
+        let declared = config.added_token_configs().map_err(Error::Tiktoken)?;
+
+        let tokenizer = match family {
+            TiktokenFamily::Kimi => {
+                let num_ranks = u32::try_from(ranks.len()).map_err(|_| {
+                    Error::Tiktoken(format!(
+                        "tiktoken.model has too many ranks: {}",
+                        ranks.len()
+                    ))
+                })?;
+                // `TiktokenConfig::kimi` owns the reserved-window layout (which
+                // ids exist and how undeclared ones are named); overlay the
+                // declared entries so their flags survive instead of being
+                // flattened to `special: true` across the whole window.
+                //
+                // On today's Kimi repos the effect is on decode, not encode:
+                // every declared token has `lstrip`/`rstrip` false, so the ids
+                // are identical either way. What differs is that K2.6 declares 7
+                // of its 23 tokens `special: false` (K3, 3 of 16) —
+                // `<|tool_call_begin|>`, `<think>`, … — and those must survive
+                // `decode(skip_special_tokens = true)`.
+                let by_id: HashMap<u32, &AddedTokenConfig> =
+                    declared.iter().map(|c| (c.id, c)).collect();
+                let named = declared.iter().map(|c| (c.id, c.content.clone()));
+                let added: Vec<AddedTokenConfig> = TiktokenConfig::kimi(num_ranks, named)
+                    .special_tokens
+                    .into_iter()
+                    .map(|(content, id)| {
+                        by_id.get(&id).map_or_else(
+                            || AddedTokenConfig {
+                                id,
+                                content,
+                                single_word: false,
+                                lstrip: false,
+                                rstrip: false,
+                                normalized: false,
+                                special: true,
+                            },
+                            |declared| (*declared).clone(),
+                        )
+                    })
+                    .collect();
+                Tokenizer::from_tiktoken_ranks_with_added_tokens(&ranks, KIMI_PATTERN, &added)?
+            }
+        };
+        Ok(Some(tokenizer))
     }
 
     /// Used by the Python layer to fetch `tokenizer.json` from the HuggingFace Hub and
@@ -1307,7 +1431,21 @@ mod tests {
 
     use super::*;
 
-    // ── Error::is_not_found, Hub arm ────────────────────────────────────────
+    const HF_MODELS: &[&str] = &[
+        "Qwen/Qwen3-0.6B",
+        "zai-org/GLM-4.7",
+        "deepseek-ai/DeepSeek-V3.2",
+        "MiniMaxAI/MiniMax-M2.1",
+        "openai/gpt-oss-120b",
+        "mistralai/Mistral-Nemo-Instruct-2407",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "nvidia/Qwen3-Nemotron-235B-A22B-GenRM",
+        "hoangquan456/Kimi-K2.5",
+    ];
+
+    // ── Error::is_not_found ─────────────────────────────────────────────────
 
     #[test]
     fn is_not_found_detects_http_404() {
@@ -1332,19 +1470,104 @@ mod tests {
         }
     }
 
-    const HF_MODELS: &[&str] = &[
-        "Qwen/Qwen3-0.6B",
-        "zai-org/GLM-4.7",
-        "deepseek-ai/DeepSeek-V3.2",
-        "MiniMaxAI/MiniMax-M2.1",
-        "openai/gpt-oss-120b",
-        "mistralai/Mistral-Nemo-Instruct-2407",
-        "Qwen/Qwen3-235B-A22B-Instruct-2507",
-        "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        "nvidia/Qwen3-Nemotron-235B-A22B-GenRM",
-        "hoangquan456/Kimi-K2.5",
-    ];
+    // ── tiktoken repositories (no tokenizer.json) ───────────────────────────
+
+    /// A repo that ships only `tiktoken.model` must load through the fallback,
+    /// and must produce exactly what the documented manual path produces. This
+    /// covers the fallback's plumbing — file discovery, family detection,
+    /// `tokenizer_config.json` parsing — against a construction that hardcodes
+    /// all of it.
+    ///
+    /// Bit-exactness against the reference tokenizer is covered separately by
+    /// `examples/validate_tiktoken.py`.
+    #[test]
+    fn tiktoken_repo_matches_explicit_construction() {
+        const MODEL: &str = "moonshotai/Kimi-K2.6";
+
+        let from_repo = Tokenizer::from_model(MODEL).unwrap();
+
+        // Same tokenizer, assembled by hand from the repo's raw files.
+        let api = make_api(None).unwrap();
+        let repo = api.model(MODEL.to_string());
+        let ranks_path = repo.get("tiktoken.model").unwrap();
+        let config: TokenizerConfig = serde_json::from_str(
+            &fs::read_to_string(repo.get("tokenizer_config.json").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let ranks =
+            tiktoken::parse_tiktoken_model(&fs::read_to_string(&ranks_path).unwrap()).unwrap();
+        let declared = config.added_token_configs().unwrap();
+        let named = declared.iter().map(|c| (c.id, c.content.clone()));
+        let explicit = Tokenizer::from_tiktoken_ranks(
+            &ranks,
+            TiktokenConfig::kimi(u32::try_from(ranks.len()).unwrap(), named),
+        )
+        .unwrap();
+
+        for text in [
+            "Hello, world!",
+            "另一个测试 with mixed 内容",
+            "def f(x):\n    return x * 2  # comment\n",
+            "數據處理與分析，機器學習模型訓練。",
+            "camelCase HTTPRequest O'Brien don't ALLCAPS 12345",
+            "  leading and trailing whitespace \n\n\t",
+            "",
+        ] {
+            assert_eq!(
+                from_repo.encode(text).unwrap(),
+                explicit.encode(text).unwrap(),
+                "mismatch for {text:?}",
+            );
+        }
+    }
+
+    /// The declared names in `added_tokens_decoder` must win over the reserved
+    /// placeholders, and must still be matched as single tokens inside ordinary
+    /// text — otherwise a chat-templated prompt's token count silently drifts.
+    #[test]
+    fn tiktoken_repo_resolves_declared_special_tokens() {
+        let tok = Tokenizer::from_model("moonshotai/Kimi-K2.6").unwrap();
+
+        // Real ids from the repo's `added_tokens_decoder`.
+        assert_eq!(tok.token_to_id("[BOS]"), Some(163_584));
+        assert_eq!(tok.token_to_id("[EOS]"), Some(163_585));
+        assert_eq!(tok.token_to_id("<|im_end|>"), Some(163_586));
+        assert_eq!(tok.token_to_id("[UNK]"), Some(163_838));
+        assert_eq!(tok.token_to_id("[PAD]"), Some(163_839));
+
+        // An undeclared slot in the reserved window keeps its placeholder.
+        assert_eq!(tok.token_to_id("<|reserved_token_163700|>"), Some(163_700));
+
+        // Declared names must not have been flattened into ordinary text.
+        assert_eq!(tok.encode("a<|im_end|>b").unwrap(), vec![64, 163_586, 65]);
+    }
+
+    /// The declared `special` flag must reach the added tokens rather than being
+    /// flattened to `true` across the reserved window. Kimi marks its tool-call
+    /// and thinking markers `special: false` precisely so they survive
+    /// `skip_special_tokens`; losing the flag makes decoding swallow them, which
+    /// surfaces far from its cause as "the model stopped emitting tool calls".
+    ///
+    /// This has to assert on `decode`: the flag does not affect ids, so `encode`
+    /// is byte-identical whether or not the flags are carried through, and an
+    /// encode-only assertion cannot catch a regression here.
+    #[test]
+    fn tiktoken_repo_preserves_declared_special_flags() {
+        let tok = Tokenizer::from_model("moonshotai/Kimi-K2.6").unwrap();
+
+        // `<|im_end|>` is declared `special: true`, `<|tool_call_begin|>` false.
+        assert!(tok.is_special_token(163_586), "<|im_end|> must be special");
+        assert!(
+            !tok.is_special_token(163_597),
+            "<|tool_call_begin|> is declared special: false and must stay non-special"
+        );
+
+        // So skipping specials drops the former and keeps the latter.
+        assert_eq!(
+            tok.decode(&[163_586, 163_597], true).unwrap(),
+            "<|tool_call_begin|>"
+        );
+    }
 
     /// Verify that `TokenizerConfig` and `TokenizerJson` deserialize
     /// successfully for a range of HuggingFace models. This tests the JSON

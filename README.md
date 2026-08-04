@@ -40,22 +40,8 @@ In particular, additional encoding outputs, and some normalizers/pretokenizers a
 
 ## Tested models
 
-The following models have been tested, but `fastokens` should generally work with most BPE tokenizers supported by the `transformers` library, including:
-
-- `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
-- `openai/gpt-oss-120b`
-- `deepseek-ai/DeepSeek-V3.2`
-- `deepseek-ai/DeepSeek-V3`
-- `deepseek-ai/DeepSeek-R1`
-- `Qwen/Qwen3-Next-80B-A3B-Thinking`
-- `Qwen/Qwen3-Next-80B-A3B-Instruct`
-- `Qwen/Qwen3-235B-A22B-Instruct-2507`
-- `Qwen/Qwen3.5-397B-A17B`
-- `MiniMaxAI/MiniMax-M2.1`
-- `MiniMaxAI/MiniMax-M2.5`
-- `mistralai/Devstral-Small-2-24B-Instruct-2512`
-- `zai-org/GLM-4.7`
-- `zai-org/GLM-5`
+Generally fastokens supports all models (Qwen's, Kimi's, Minimax, Gemma, DeepSeek were all families that verified and tested).
+There might be exceptions though - we suggest to verify your model with the verification script.
 
 
 ## Usage

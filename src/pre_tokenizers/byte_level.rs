@@ -101,14 +101,6 @@ pub(crate) fn encode_bytes_into(s: &str, out: &mut String) {
     }
 }
 
-/// Append the byte-level encoding of `s` to `out` without checking capacity.
-///
-/// # Safety
-/// `out` must have at least `s.len() * 2` bytes of spare capacity.
-unsafe fn encode_bytes_into_unchecked(s: &str, out: &mut String) {
-    unsafe { encode_bytes_bulk(s.as_bytes(), out.as_mut_vec()) };
-}
-
 /// Encode a string by mapping each byte of its UTF-8 representation to the
 /// corresponding visible character from the GPT-2 byte-to-unicode table.
 #[cfg(test)]
@@ -305,9 +297,12 @@ impl ByteLevel {
                 continue;
             }
             let start = new_buf.len();
-            // SAFETY: new_buf has capacity old_buf.len()*2 and total encoded
-            // output never exceeds that.
-            unsafe { encode_bytes_into_unchecked(text, &mut new_buf) };
+            // `with_capacity(old_buf.len()*2)` above sizes `new_buf` for the
+            // common case where splits partition the buffer. Callers may pass
+            // overlapping ranges, though, so total encoded output can exceed
+            // that hint; `encode_bytes_into` reserves per split to stay in
+            // bounds (a no-op when the hint already suffices).
+            encode_bytes_into(text, &mut new_buf);
             let end = new_buf.len();
             new_splits.push(PtSplit {
                 range: start..end,
@@ -520,6 +515,35 @@ mod tests {
             .expect("added token split missing");
         // Its text should be byte-encoded.
         assert_eq!(pts.split_text(added), encode_bytes("<sep>"));
+    }
+
+    #[test]
+    fn overlapping_splits_do_not_overflow() {
+        // Regression: the bulk fast path (use_regex=false, add_prefix_space=
+        // false) once reserved capacity from the input length once and encoded
+        // each split unchecked. Overlapping splits make the total encoded
+        // output exceed that reservation, causing an out-of-bounds heap write.
+        // Here eight fully-overlapping splits encode 8 * buffer.len() bytes
+        // into a buffer sized for a single pass.
+        let bl = ByteLevel::from_config(false, true, false).unwrap();
+        let buffer = "\u{FF}".repeat(1024); // non-ASCII → 2 output bytes/byte.
+        let buf_len = buffer.len();
+        let splits = (0..8)
+            .map(|_| PtSplit {
+                range: 0..buf_len,
+                token_id: None,
+            })
+            .collect();
+        let mut pts = PreTokenizedString::new(buffer, splits);
+
+        // Must not corrupt the heap or panic on an over-capacity set_len.
+        bl.pre_tokenize(&mut pts).unwrap();
+
+        // Each of the 8 splits re-encodes the whole buffer independently.
+        let expected = encode_bytes(&"\u{FF}".repeat(1024));
+        for split in pts.splits() {
+            assert_eq!(pts.split_text(split), expected);
+        }
     }
 
     // ── Serde ─────────────────────────────────────────

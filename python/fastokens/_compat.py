@@ -78,6 +78,8 @@ class _TokenizerShim:
                 f"got {type(src).__name__}"
             )
         self._encode_special_tokens: bool = False
+        # Whether add_tokens has grown the vocabulary past what `_json` holds.
+        self._vocab_extended: bool = False
 
     # -- Pickle / copy --------------------------------------------------
 
@@ -112,7 +114,11 @@ class _TokenizerShim:
         memo[id(self)] = new
         new._json = self._json
         new._pcre2_options = dict(self._pcre2_options)
-        new._fast = Tokenizer.from_json_str(self._json, **new._pcre2_options)
+        # Once the vocabulary has been extended the source JSON is no longer
+        # the whole tokenizer, so the copy has to be built from the live state.
+        source = self.to_str() if self._vocab_extended else self._json
+        new._vocab_extended = self._vocab_extended
+        new._fast = Tokenizer.from_json_str(source, **new._pcre2_options)
         trunc = self._fast.truncation
         if trunc is not None:
             new._fast.enable_truncation(**trunc)
@@ -160,6 +166,9 @@ class _TokenizerShim:
         cfg = json.loads(self._json)
         cfg["truncation"] = self._fast.truncation
         cfg["padding"] = self._fast.padding
+        # Read the added tokens back from the backend rather than the source
+        # JSON, so tokens added after construction survive serialization.
+        cfg["added_tokens"] = self._fast.added_tokens()
         if pretty:
             return json.dumps(cfg, indent=2, ensure_ascii=False)
         return json.dumps(cfg, ensure_ascii=False)
@@ -250,7 +259,11 @@ class _TokenizerShim:
             raise NotImplementedError("pair encoding is not supported by fastokens")
         if is_pretokenized:
             raise NotImplementedError("pre-tokenized input is not supported by fastokens")
-        return self._fast.encode(sequence, add_special_tokens=add_special_tokens)
+        return self._fast.encode(
+            sequence,
+            add_special_tokens=add_special_tokens,
+            split_special_tokens=self._encode_special_tokens,
+        )
 
     def encode_batch(
         self,
@@ -263,7 +276,11 @@ class _TokenizerShim:
             raise NotImplementedError(
                 "pair/pre-tokenized batch encoding is not supported by fastokens"
             )
-        return self._fast.encode_batch(inputs, add_special_tokens=add_special_tokens)
+        return self._fast.encode_batch(
+            inputs,
+            add_special_tokens=add_special_tokens,
+            split_special_tokens=self._encode_special_tokens,
+        )
 
     def encode_batch_fast(
         self,
@@ -275,7 +292,11 @@ class _TokenizerShim:
             raise NotImplementedError(
                 "pair/pre-tokenized batch encoding is not supported by fastokens"
             )
-        return self._fast.encode_batch(inputs, add_special_tokens=add_special_tokens)
+        return self._fast.encode_batch(
+            inputs,
+            add_special_tokens=add_special_tokens,
+            split_special_tokens=self._encode_special_tokens,
+        )
 
     # -- Post-processing ------------------------------------------------
 
@@ -316,37 +337,66 @@ class _TokenizerShim:
             tok = self._fast.id_to_token(i)
             if tok is not None:
                 vocab[tok] = i
+        # An added token can sit above the vocabulary size when the declared ids
+        # leave a gap, so the id scan alone can miss one.
+        for entry in self._fast.added_tokens():
+            vocab[entry["content"]] = entry["id"]
         return vocab
 
     def get_vocab_size(self, with_added_tokens: bool = True) -> int:
+        # fastokens reports one number for both: the count of distinct token
+        # strings, which is `get_vocab_size(True)` upstream. `False` should be
+        # the base vocabulary alone, but the backend does not track the split,
+        # and over-reporting is the safer direction for callers that size
+        # embedding tables or logit masks from it.
         return self._fast.vocab_size
 
     def get_added_tokens_decoder(self) -> dict[int, object]:
-        try:
-            cfg = json.loads(self._json)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-        result: dict[int, object] = {}
-        for entry in cfg.get("added_tokens", []):
-            tid = entry.get("id")
-            if tid is not None:
-                result[tid] = _AddedTokenInfo(
-                    content=entry.get("content", ""),
-                    single_word=entry.get("single_word", False),
-                    lstrip=entry.get("lstrip", False),
-                    rstrip=entry.get("rstrip", False),
-                    normalized=entry.get("normalized", True),
-                    special=entry.get("special", False),
-                )
-        return result
+        return {
+            entry["id"]: _AddedTokenInfo(
+                content=entry["content"],
+                single_word=entry["single_word"],
+                lstrip=entry["lstrip"],
+                rstrip=entry["rstrip"],
+                normalized=entry["normalized"],
+                special=entry["special"],
+            )
+            for entry in self._fast.added_tokens()
+        }
 
-    # -- Token management (no-ops) --------------------------------------
+    # -- Token management -----------------------------------------------
 
     def add_tokens(self, tokens) -> int:
-        return 0
+        """Extend the vocabulary, returning the number of tokens added.
+
+        Accepts plain strings and ``AddedToken``-like objects. Ids are assigned
+        as HuggingFace ``tokenizers`` assigns them, so a loader that pads a
+        tokenizer up to a checkpoint's embedding count lands the placeholders on
+        the padded rows.
+        """
+        return self._add_tokens(tokens, special=False)
 
     def add_special_tokens(self, special_tokens) -> int:
-        return 0
+        """:meth:`add_tokens` for special tokens.
+
+        A token already in the vocabulary is not duplicated; it is promoted to
+        special, which is what makes ``encode_special_tokens`` skip it.
+        """
+        return self._add_tokens(special_tokens, special=True)
+
+    def _add_tokens(self, tokens, special: bool) -> int:
+        specs = [
+            token
+            if hasattr(token, "content")
+            # `AddedToken.from(content, special)` leaves special tokens
+            # unnormalized; mirror that for bare strings.
+            else _AddedTokenInfo(content=token, normalized=not special, special=special)
+            for token in tokens
+        ]
+        added = self._fast.add_tokens(specs)
+        if added:
+            self._vocab_extended = True
+        return len(added)
 
     # -- Component accessors --------------------------------------------
 

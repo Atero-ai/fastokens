@@ -13,6 +13,10 @@ use crate::json_structs::AddedTokenConfig;
 /// through normalization, pre-tokenization and the model as usual.
 pub struct AddedTokens {
     daac: DoubleArrayAhoCorasick<u32>,
+    /// The entries this set was compiled from. Kept because compilation is
+    /// lossy — `single_word` and `normalized` are not represented in the
+    /// matcher — so an extended set cannot be rebuilt from the fields below.
+    configs: Vec<AddedTokenConfig>,
     /// Token lengths (in bytes) indexed by token ID, for matched tokens only.
     /// Non-added token IDs map to 0.
     token_lens: Vec<usize>,
@@ -110,6 +114,7 @@ impl AddedTokens {
 
         Ok(Some(Self {
             daac,
+            configs: configs.to_vec(),
             token_lens,
             lstrip,
             rstrip,
@@ -119,6 +124,14 @@ impl AddedTokens {
             content_to_id,
             special_ids,
         }))
+    }
+
+    /// The entries this set was built from, in declaration order.
+    ///
+    /// Callers that extend the vocabulary append to this and rebuild with
+    /// [`Self::from_configs`].
+    pub fn configs(&self) -> &[AddedTokenConfig] {
+        &self.configs
     }
 
     /// Look up the string content of an added token by ID.
@@ -177,6 +190,18 @@ impl AddedTokens {
     /// emitted as [`Segment::Token`]; the gaps between them as
     /// [`Segment::Text`].
     pub fn split<'a>(&self, input: &'a str) -> Vec<Segment<'a>> {
+        self.split_with(input, false)
+    }
+
+    /// Split `input`, optionally leaving special tokens as ordinary text.
+    ///
+    /// With `skip_special`, an entry flagged `special` is consumed by the scan
+    /// but emitted as part of the surrounding [`Segment::Text`] instead of as a
+    /// [`Segment::Token`], so control-token strings in untrusted input cannot
+    /// produce control-token IDs. Non-special added tokens still match. This is
+    /// what HuggingFace `tokenizers` does under `encode_special_tokens`, which
+    /// `transformers` sets for `split_special_tokens=True`.
+    pub fn split_with<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
         // When there are few distinct start bytes, use SIMD memchr to skip
         // positions that cannot start any added token. This avoids scanning
         // the full input through the Aho-Corasick automaton.
@@ -184,10 +209,12 @@ impl AddedTokens {
             1 => self.split_prefilter(
                 input,
                 memchr::memchr_iter(self.start_bytes[0], input.as_bytes()),
+                skip_special,
             ),
             2 => self.split_prefilter(
                 input,
                 memchr::memchr2_iter(self.start_bytes[0], self.start_bytes[1], input.as_bytes()),
+                skip_special,
             ),
             3 => self.split_prefilter(
                 input,
@@ -197,8 +224,9 @@ impl AddedTokens {
                     self.start_bytes[2],
                     input.as_bytes(),
                 ),
+                skip_special,
             ),
-            _ => self.split_full_scan(input),
+            _ => self.split_full_scan(input, skip_special),
         }
     }
 
@@ -207,12 +235,17 @@ impl AddedTokens {
         &self,
         input: &'a str,
         candidates: impl Iterator<Item = usize>,
+        skip_special: bool,
     ) -> Vec<Segment<'a>> {
         let mut segments = Vec::new();
         let mut prev_end = 0;
+        // End of the last match, emitted or not. A skipped special token still
+        // consumes its span, so a candidate inside it cannot start a second
+        // match — the full-scan path's automaton advances the same way.
+        let mut scan_from = 0;
 
         for pos in candidates {
-            if pos < prev_end {
+            if pos < scan_from {
                 continue;
             }
             // Run the DAAC on a short window starting at this position.
@@ -225,6 +258,10 @@ impl AddedTokens {
             if let Some(m) = self.daac.leftmost_find_iter(window).next()
                 && m.start() == 0
             {
+                if skip_special && self.is_special(m.value()) {
+                    scan_from = pos + m.end();
+                    continue;
+                }
                 let (start, end) =
                     self.strip_bounds(input, m.value(), pos, pos + m.end(), prev_end);
                 if start > prev_end {
@@ -232,6 +269,7 @@ impl AddedTokens {
                 }
                 segments.push(Segment::Token(m.value()));
                 prev_end = end;
+                scan_from = end;
             }
         }
 
@@ -285,11 +323,14 @@ impl AddedTokens {
     }
 
     /// Full-scan fallback for >3 distinct start bytes.
-    fn split_full_scan<'a>(&self, input: &'a str) -> Vec<Segment<'a>> {
+    fn split_full_scan<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
         let mut segments = Vec::new();
         let mut prev_end = 0;
 
         for m in self.daac.leftmost_find_iter(input) {
+            if skip_special && self.is_special(m.value()) {
+                continue;
+            }
             let (start, end) = self.strip_bounds(input, m.value(), m.start(), m.end(), prev_end);
             if start > prev_end {
                 segments.push(Segment::Text(&input[prev_end..start]));
@@ -725,6 +766,102 @@ mod tests {
             at.split("<a><b>"),
             vec![Segment::Token(1), Segment::Token(2)]
         );
+    }
+
+    // ── skip_special (HF `encode_special_tokens`) ───────────────────────
+
+    #[test]
+    fn skip_special_leaves_special_tokens_as_text() {
+        let mut special = make_config(1, "<|user|>");
+        special.special = true;
+        let at = AddedTokens::from_configs(&[special]).unwrap().unwrap();
+
+        assert_eq!(
+            at.split_with("a<|user|>b", false),
+            vec![Segment::Text("a"), Segment::Token(1), Segment::Text("b"),]
+        );
+        assert_eq!(
+            at.split_with("a<|user|>b", true),
+            vec![Segment::Text("a<|user|>b")]
+        );
+    }
+
+    #[test]
+    fn skip_special_keeps_non_special_tokens() {
+        // The distinction HuggingFace draws: only entries flagged `special` are
+        // skipped, so ordinary added vocabulary still tokenizes as itself.
+        let mut special = make_config(1, "<|user|>");
+        special.special = true;
+        let plain = make_config(2, "<think>");
+        let at = AddedTokens::from_configs(&[special, plain])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            at.split_with("<|user|><think>", true),
+            vec![Segment::Text("<|user|>"), Segment::Token(2),]
+        );
+    }
+
+    #[test]
+    fn skip_special_does_not_absorb_whitespace() {
+        // A skipped token is text, so its strip flags must not eat the spaces
+        // around it the way an emitted token would.
+        let at = AddedTokens::from_configs(&[make_strip_config(1, "<s>", true, true)])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            at.split_with("ab <s> cd", false),
+            vec![Segment::Text("ab"), Segment::Token(1), Segment::Text("cd"),]
+        );
+        assert_eq!(
+            at.split_with("ab <s> cd", true),
+            vec![Segment::Text("ab <s> cd")]
+        );
+    }
+
+    #[test]
+    fn skip_special_consumes_the_matched_span() {
+        // A candidate start byte *inside* a skipped token must not start a
+        // second match: the full-scan automaton advances past the whole match,
+        // and the prefiltered path has to agree.
+        let mut outer = make_config(1, "<a<b>");
+        outer.special = true;
+        let inner = make_config(2, "<b>");
+        let at = AddedTokens::from_configs(&[outer, inner]).unwrap().unwrap();
+
+        assert_eq!(at.split_with("<a<b>", true), vec![Segment::Text("<a<b>")]);
+    }
+
+    #[test]
+    fn skip_special_via_full_scan_path() {
+        // >3 distinct start bytes forces the full-scan path.
+        let mut special = make_config(1, "<bos>");
+        special.special = true;
+        let at = AddedTokens::from_configs(&[
+            special,
+            make_config(2, "[SEP]"),
+            make_config(3, "{pad}"),
+            make_config(4, "|mask|"),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            at.split_with("<bos>[SEP]", true),
+            vec![Segment::Text("<bos>"), Segment::Token(2),]
+        );
+    }
+
+    #[test]
+    fn configs_are_retained_for_rebuilding() {
+        let configs = vec![
+            make_strip_config(1, "<a>", true, false),
+            make_config(2, "<b>"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(at.configs(), configs.as_slice());
     }
 
     #[test]

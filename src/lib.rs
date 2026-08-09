@@ -400,6 +400,12 @@ impl InputCache {
         }
     }
 
+    /// Drop every cached encoding. Required whenever the vocabulary changes,
+    /// since entries were tokenized against the previous one.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Decide how much of `input`'s encoding can be reused from a cached entry.
     /// Returns `None` when nothing worthwhile is shared.
     fn reuse_plan(&self, input: &[u8]) -> Option<Reuse> {
@@ -492,6 +498,69 @@ pub struct EncodeSegment<'a> {
     pub text: &'a str,
     /// Whether special/added tokens are recognized within `text`.
     pub allow_special: bool,
+}
+
+/// Which added-vocabulary entries an encode recognizes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AddedTokenPolicy {
+    /// Recognize every added token. The default.
+    #[default]
+    All,
+    /// Recognize only the added tokens that are not flagged `special`; special
+    /// ones are encoded as ordinary text. Mirrors `encode_special_tokens` in
+    /// HuggingFace `tokenizers`, which is what `transformers` sets for
+    /// `split_special_tokens=True`.
+    SkipSpecial,
+    /// Recognize none: the whole input goes through the base pipeline.
+    None,
+}
+
+/// A token to append to the vocabulary, before an ID is assigned.
+///
+/// Mirrors the fields of an `added_tokens` entry in `tokenizer.json` minus its
+/// ID, which [`Tokenizer::add_tokens`] assigns.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewToken {
+    /// Literal text content that triggers the token.
+    pub content: String,
+    /// Whether the token should only match as a whole word. Recorded but not
+    /// yet honored by matching, as for tokens declared in `tokenizer.json`.
+    pub single_word: bool,
+    /// Absorb adjacent whitespace on the left when matching.
+    pub lstrip: bool,
+    /// Absorb adjacent whitespace on the right when matching.
+    pub rstrip: bool,
+    /// Whether the content is matched against normalized text. Recorded but not
+    /// yet honored by matching, as for tokens declared in `tokenizer.json`.
+    pub normalized: bool,
+    /// Whether this is a "special" token (e.g. BOS/EOS). Special tokens are
+    /// dropped by `skip_special_tokens` decodes and by
+    /// [`AddedTokenPolicy::SkipSpecial`] encodes.
+    pub special: bool,
+}
+
+impl NewToken {
+    /// An ordinary added token, matched literally.
+    ///
+    /// `normalized` follows upstream's `AddedToken::from`, which sets it for
+    /// ordinary tokens and clears it for special ones. It matters because
+    /// re-adding a token is a no-op only when every field matches.
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            normalized: true,
+            ..Self::default()
+        }
+    }
+
+    /// A special added token (BOS/EOS/control markers).
+    pub fn special(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            special: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl<'a> EncodeSegment<'a> {
@@ -873,6 +942,106 @@ impl Tokenizer {
         self.added_tokens.as_ref()
     }
 
+    /// The added-vocabulary entries, in declaration order.
+    pub fn added_token_configs(&self) -> &[AddedTokenConfig] {
+        self.added_tokens.as_ref().map_or(&[], AddedTokens::configs)
+    }
+
+    /// Extend the vocabulary with `tokens`, returning the entries created or
+    /// changed, in the order given.
+    ///
+    /// IDs are assigned the way HuggingFace `tokenizers` assigns them, so a
+    /// tokenizer extended here and one extended there agree:
+    ///
+    /// - A content already in the added vocabulary keeps its ID; only its flags
+    ///   can change (this is how a token is promoted to `special`). An entry
+    ///   that would not change at all is not reported.
+    /// - A content the model already carries becomes an added token at that
+    ///   same ID, leaving the vocabulary size untouched.
+    /// - Anything else is appended above the vocabulary, contiguously.
+    ///
+    /// The last case is the one serving stacks depend on: a checkpoint whose
+    /// embedding matrix is padded above the tokenizer's token count is squared
+    /// up by appending placeholder tokens until [`Self::vocab_size`] matches the
+    /// embedding count, after which every ID below it resolves.
+    ///
+    /// Empty contents are ignored, as they are upstream. Repeats within one
+    /// call collapse, so a batch can never claim two IDs for one string.
+    pub fn add_tokens(&mut self, tokens: &[NewToken]) -> Result<Vec<AddedTokenConfig>, Error> {
+        let mut configs = self.added_token_configs().to_vec();
+        let mut index_of: HashMap<String, usize> = configs
+            .iter()
+            .enumerate()
+            .map(|(index, config)| (config.content.clone(), index))
+            .collect();
+
+        // Upstream appends above the model vocabulary, unless added IDs already
+        // reach past it — then it continues from the highest one.
+        let model_size = self.model.vocab_size() as u32;
+        let mut next_id = match configs.iter().map(|config| config.id).max() {
+            Some(max) if max >= model_size => max + 1,
+            _ => model_size,
+        };
+
+        let mut changed = Vec::new();
+        for token in tokens {
+            if token.content.is_empty() {
+                continue;
+            }
+            let entry = AddedTokenConfig {
+                // Replaced below; every branch decides its own ID.
+                id: 0,
+                content: token.content.clone(),
+                single_word: token.single_word,
+                lstrip: token.lstrip,
+                rstrip: token.rstrip,
+                normalized: token.normalized,
+                special: token.special,
+            };
+
+            match index_of.get(&token.content).copied() {
+                Some(index) => {
+                    let updated = AddedTokenConfig {
+                        id: configs[index].id,
+                        ..entry
+                    };
+                    if configs[index] == updated {
+                        continue;
+                    }
+                    configs[index] = updated.clone();
+                    changed.push(updated);
+                }
+                None => {
+                    let id = self.model.token_to_id(&token.content).unwrap_or_else(|| {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    });
+                    let entry = AddedTokenConfig { id, ..entry };
+                    index_of.insert(token.content.clone(), configs.len());
+                    configs.push(entry.clone());
+                    changed.push(entry);
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+
+        // Compile before committing: a rejected set must leave the tokenizer as
+        // it was rather than half-extended.
+        let added_tokens = AddedTokens::from_configs(&configs).map_err(Error::Model)?;
+        self.added_tokens = added_tokens;
+
+        // Cached encodings were produced against the previous vocabulary.
+        if let Some(cache) = &self.input_cache {
+            cache.lock().unwrap().clear();
+        }
+
+        Ok(changed)
+    }
+
     /// Return the decoder, if any.
     pub fn decoder(&self) -> Option<&Decoder> {
         self.decoder.as_ref()
@@ -907,7 +1076,7 @@ impl Tokenizer {
         input: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Error> {
-        self.encode_inner(input, add_special_tokens, true)
+        self.encode_inner(input, add_special_tokens, AddedTokenPolicy::All)
     }
 
     /// Encode through the base tokenizer pipeline without recognizing added
@@ -918,7 +1087,21 @@ impl Tokenizer {
     /// bypassed. Normalization, pre-tokenization, model tokenization, and
     /// post-processing are preserved.
     pub fn encode_ordinary(&self, input: &str) -> Result<Vec<u32>, Error> {
-        self.encode_inner(input, false, false)
+        self.encode_inner(input, false, AddedTokenPolicy::None)
+    }
+
+    /// Run the full encoding pipeline under an explicit [`AddedTokenPolicy`].
+    ///
+    /// [`AddedTokenPolicy::SkipSpecial`] is the one the other entry points do
+    /// not cover: control-token strings are encoded as ordinary text while the
+    /// rest of the added vocabulary still matches.
+    pub fn encode_with_policy(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> Result<Vec<u32>, Error> {
+        self.encode_inner(input, add_special_tokens, policy)
     }
 
     /// Encode a pre-segmented input, concatenating the token ids of each
@@ -935,13 +1118,21 @@ impl Tokenizer {
     /// No post-processor special tokens (BOS/EOS) are inserted — the caller's
     /// segments are expected to already carry the full rendered sequence.
     pub fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>, Error> {
+        fn policy(seg: &EncodeSegment<'_>) -> AddedTokenPolicy {
+            if seg.allow_special {
+                AddedTokenPolicy::All
+            } else {
+                AddedTokenPolicy::None
+            }
+        }
+
         // Single-segment shortcut avoids a second allocation + copy.
         if let [seg] = segments {
-            return self.encode_inner(seg.text, false, seg.allow_special);
+            return self.encode_inner(seg.text, false, policy(seg));
         }
         let mut ids = Vec::new();
         for seg in segments {
-            let seg_ids = self.encode_inner(seg.text, false, seg.allow_special)?;
+            let seg_ids = self.encode_inner(seg.text, false, policy(seg))?;
             if ids.is_empty() {
                 ids = seg_ids;
             } else {
@@ -955,7 +1146,7 @@ impl Tokenizer {
         &self,
         input: &str,
         add_special_tokens: bool,
-        recognize_added_tokens: bool,
+        policy: AddedTokenPolicy,
     ) -> Result<Vec<u32>, Error> {
         if input.is_empty() {
             return if add_special_tokens {
@@ -966,10 +1157,10 @@ impl Tokenizer {
         }
 
         // 1. Normalize the input, optionally recognizing added vocabulary.
-        let mut pts = if recognize_added_tokens {
-            self.build_pre_tokenized(input)
-        } else {
-            self.build_pre_tokenized_ordinary(input)
+        let mut pts = match policy {
+            AddedTokenPolicy::All => self.build_pre_tokenized_with(input, false),
+            AddedTokenPolicy::SkipSpecial => self.build_pre_tokenized_with(input, true),
+            AddedTokenPolicy::None => self.build_pre_tokenized_ordinary(input),
         };
 
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
@@ -1218,8 +1409,14 @@ impl Tokenizer {
     /// Build a [`PreTokenizedString`] by splitting on added tokens and
     /// normalizing text segments into a single contiguous buffer.
     pub fn build_pre_tokenized(&self, input: &str) -> PreTokenizedString {
+        self.build_pre_tokenized_with(input, false)
+    }
+
+    /// [`Self::build_pre_tokenized`], optionally leaving special tokens as
+    /// ordinary text (see [`AddedTokens::split_with`]).
+    pub fn build_pre_tokenized_with(&self, input: &str, skip_special: bool) -> PreTokenizedString {
         let segments = match &self.added_tokens {
-            Some(at) => at.split(input),
+            Some(at) => at.split_with(input, skip_special),
             None => vec![Segment::Text(input)],
         };
 
@@ -1619,6 +1816,286 @@ mod local_tests {
                 "id {id} is counted but has no token"
             );
         }
+    }
+
+    // ── add_tokens ──────────────────────────────────────────────────────
+
+    /// A `tokenizer.json`, as text, so the same bytes can be loaded by both
+    /// this crate and HuggingFace `tokenizers` for parity checks.
+    ///
+    /// The model vocabulary is the distinct characters of `chars`, one ID each,
+    /// so any text over them encodes to one ID per character. Added tokens are
+    /// appended above it in the order given.
+    fn tokenizer_json(chars: &str, added: &[(&str, bool)]) -> String {
+        let mut distinct: Vec<char> = chars.chars().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let vocab: serde_json::Map<String, Value> = distinct
+            .iter()
+            .enumerate()
+            .map(|(id, ch)| (ch.to_string(), Value::from(id)))
+            .collect();
+        let base = vocab.len() as u32;
+        let added_tokens: Vec<Value> = added
+            .iter()
+            .enumerate()
+            .map(|(offset, (content, special))| {
+                json!({
+                    "id": base + offset as u32,
+                    "content": content,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": special,
+                })
+            })
+            .collect();
+        json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added_tokens,
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {"type": "BPE", "vocab": vocab, "merges": []},
+        })
+        .to_string()
+    }
+
+    fn tokenizer_of(chars: &str, added: &[(&str, bool)]) -> Tokenizer {
+        Tokenizer::from_json(serde_json::from_str(&tokenizer_json(chars, added)).unwrap()).unwrap()
+    }
+
+    /// The scenario this exists for: a checkpoint whose embedding matrix is
+    /// padded above the tokenizer's token count. The loader appends placeholder
+    /// tokens until the two agree, then indexes every ID below the count.
+    #[test]
+    fn add_tokens_pads_a_tokenizer_up_to_an_embedding_count() {
+        let mut tok = tokenizer_of("abc", &[("<|endoftext|>", true), ("<think>", false)]);
+        assert_eq!(tok.vocab_size(), 5);
+
+        let num_model_embeddings = 9;
+        let placeholders: Vec<NewToken> = (0..num_model_embeddings - tok.vocab_size())
+            .map(|i| NewToken::new(format!("<|padding_token_{i}|>")))
+            .collect();
+        let added = tok.add_tokens(&placeholders).unwrap();
+
+        assert_eq!(added.len(), 4);
+        assert_eq!(
+            added.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8],
+            "placeholders should land contiguously on the padded rows"
+        );
+        assert_eq!(tok.vocab_size(), num_model_embeddings);
+        for id in 0..tok.vocab_size() as u32 {
+            assert!(tok.id_to_token(id).is_some(), "id {id} has no token");
+        }
+        assert_eq!(tok.token_to_id("<|padding_token_0|>"), Some(5));
+    }
+
+    /// ID assignment has to agree with HuggingFace `tokenizers`, since callers
+    /// swap the two backends under the same loader.
+    #[test]
+    fn add_tokens_matches_huggingface() {
+        use std::str::FromStr;
+
+        // Cases: brand-new contents, a repeat of one, a string the model
+        // already carries, and a promotion of an existing added token.
+        let batches: [&[(&str, bool)]; 4] = [
+            &[("<|pad0|>", false), ("<|pad1|>", false)],
+            &[("<|pad0|>", false)],
+            &[("a", false)],
+            &[("<think>", true)],
+        ];
+
+        let json = tokenizer_json("abc", &[("<|endoftext|>", true), ("<think>", false)]);
+        let mut ours = Tokenizer::from_json(serde_json::from_str(&json).unwrap()).unwrap();
+        let mut theirs = tokenizers::Tokenizer::from_str(&json).unwrap();
+
+        for batch in batches {
+            let mine: Vec<NewToken> = batch
+                .iter()
+                .map(|(content, special)| {
+                    if *special {
+                        NewToken::special(*content)
+                    } else {
+                        NewToken::new(*content)
+                    }
+                })
+                .collect();
+            let hf: Vec<tokenizers::AddedToken> = batch
+                .iter()
+                .map(|(content, special)| tokenizers::AddedToken::from(*content, *special))
+                .collect();
+
+            ours.add_tokens(&mine).unwrap();
+            theirs.add_tokens(&hf);
+
+            assert_eq!(
+                ours.vocab_size(),
+                theirs.get_vocab_size(true),
+                "vocabulary size diverged after adding {batch:?}"
+            );
+            for (content, _) in batch {
+                assert_eq!(
+                    ours.token_to_id(content),
+                    theirs.token_to_id(content),
+                    "id diverged for {content:?} after adding {batch:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn add_tokens_is_idempotent() {
+        let mut tok = tokenizer_of("abc", &[("<think>", false)]);
+        let before = tok.vocab_size();
+
+        assert_eq!(
+            tok.add_tokens(&[NewToken::new("<|pad|>")]).unwrap().len(),
+            1
+        );
+        assert_eq!(tok.vocab_size(), before + 1);
+
+        // Re-adding reports nothing changed and claims no second ID, which is
+        // what protects the loaders that re-run their padding step.
+        assert!(
+            tok.add_tokens(&[NewToken::new("<|pad|>")])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(tok.vocab_size(), before + 1);
+
+        // Re-declaring a token from `tokenizer.json` is a no-op only when every
+        // field matches — upstream compares the whole entry, so a differing
+        // flag is an update rather than a duplicate (see the promotion test).
+        let declared = NewToken {
+            normalized: false,
+            ..NewToken::new("<think>")
+        };
+        assert!(tok.add_tokens(&[declared]).unwrap().is_empty());
+        assert_eq!(tok.vocab_size(), before + 1);
+    }
+
+    #[test]
+    fn add_tokens_collapses_repeats_within_one_batch() {
+        let mut tok = tokenizer_of("abc", &[]);
+        let before = tok.vocab_size();
+
+        let added = tok
+            .add_tokens(&[
+                NewToken::new("<|pad|>"),
+                NewToken::new("<|pad|>"),
+                NewToken::new(""),
+            ])
+            .unwrap();
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(tok.vocab_size(), before + 1);
+    }
+
+    #[test]
+    fn add_tokens_promotes_an_existing_token_to_special() {
+        let mut tok = tokenizer_of("abc", &[("<think>", false)]);
+        let think = tok.token_to_id("<think>").unwrap();
+        assert!(!tok.is_special_token(think));
+        let before = tok.vocab_size();
+
+        let changed = tok.add_tokens(&[NewToken::special("<think>")]).unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, think, "promotion must not move the ID");
+        assert!(tok.is_special_token(think));
+        assert_eq!(tok.vocab_size(), before);
+    }
+
+    #[test]
+    fn add_tokens_keeps_the_id_of_a_string_the_model_already_has() {
+        let mut tok = tokenizer_of("abc", &[]);
+        let a = tok.token_to_id("a").unwrap();
+        let before = tok.vocab_size();
+
+        let changed = tok.add_tokens(&[NewToken::special("a")]).unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, a);
+        assert_eq!(tok.vocab_size(), before, "no new string, no new entry");
+        assert!(tok.is_special_token(a));
+    }
+
+    #[test]
+    fn added_tokens_are_recognized_when_encoding() {
+        let mut tok = tokenizer_of("ab<|pd|>", &[]);
+        tok.add_tokens(&[NewToken::new("<|pd|>")]).unwrap();
+        let pad = tok.token_to_id("<|pd|>").unwrap();
+
+        assert_eq!(
+            tok.encode("a<|pd|>b").unwrap(),
+            vec![
+                tok.token_to_id("a").unwrap(),
+                pad,
+                tok.token_to_id("b").unwrap(),
+            ]
+        );
+        assert_eq!(tok.decode(&[pad], false).unwrap(), "<|pd|>");
+    }
+
+    #[test]
+    fn input_cache_clear_drops_entries() {
+        let mut cache = InputCache::new(2);
+        cache.insert(b"hello world", &[1, 2, 3], vec![(0, 0)]);
+        assert!(cache.reuse_plan(b"hello world").is_some());
+
+        cache.clear();
+        assert!(cache.reuse_plan(b"hello world").is_none());
+    }
+
+    // ── AddedTokenPolicy ────────────────────────────────────────────────
+
+    #[test]
+    fn encode_policy_skips_only_special_added_tokens() {
+        let tok = tokenizer_of(
+            "abc<|user|><think>",
+            &[("<|user|>", true), ("<think>", false)],
+        );
+        let user = tok.token_to_id("<|user|>").unwrap();
+        let think = tok.token_to_id("<think>").unwrap();
+        let text = "a<|user|>b<think>c";
+
+        let all = tok
+            .encode_with_policy(text, false, AddedTokenPolicy::All)
+            .unwrap();
+        assert!(all.contains(&user) && all.contains(&think));
+
+        // The special token becomes its characters; the ordinary added token is
+        // still a single ID.
+        let skip = tok
+            .encode_with_policy(text, false, AddedTokenPolicy::SkipSpecial)
+            .unwrap();
+        let mut expected = tok.encode_ordinary("a<|user|>b").unwrap();
+        expected.push(think);
+        expected.extend(tok.encode_ordinary("c").unwrap());
+        assert_eq!(skip, expected);
+
+        let none = tok
+            .encode_with_policy(text, false, AddedTokenPolicy::None)
+            .unwrap();
+        assert_eq!(none, tok.encode_ordinary(text).unwrap());
+        assert!(!none.contains(&user) && !none.contains(&think));
+    }
+
+    #[test]
+    fn encode_policy_default_is_unchanged_behavior() {
+        let tok = tokenizer_of("abc<|user|>", &[("<|user|>", true)]);
+        let text = "a<|user|>c";
+        assert_eq!(
+            tok.encode_with_policy(text, false, AddedTokenPolicy::default())
+                .unwrap(),
+            tok.encode(text).unwrap()
+        );
     }
 }
 

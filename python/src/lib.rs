@@ -1,6 +1,6 @@
 use std::sync::RwLock;
 
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::Value;
@@ -450,6 +450,37 @@ struct PyTokenizer {
 }
 
 impl PyTokenizer {
+    fn sanitize_decode_ids(ids: Vec<i64>) -> Vec<u32> {
+        ids.into_iter()
+            .filter_map(|id| (0..=u32::MAX as i64).contains(&id).then_some(id as u32))
+            .collect()
+    }
+
+    fn extract_decode_ids(ids: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+        match ids.extract::<Vec<u32>>() {
+            Ok(ids) => Ok(ids),
+            Err(err) if err.is_instance_of::<PyOverflowError>(ids.py()) => {
+                let ids = ids.extract::<Vec<i64>>()?;
+                Ok(Self::sanitize_decode_ids(ids))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn extract_decode_batch_ids(sentences: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u32>>> {
+        match sentences.extract::<Vec<Vec<u32>>>() {
+            Ok(sentences) => Ok(sentences),
+            Err(err) if err.is_instance_of::<PyOverflowError>(sentences.py()) => {
+                let sentences = sentences.extract::<Vec<Vec<i64>>>()?;
+                Ok(sentences
+                    .into_iter()
+                    .map(Self::sanitize_decode_ids)
+                    .collect())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
         self.state.read().expect("PyTokenizer state lock poisoned")
     }
@@ -1041,7 +1072,12 @@ impl PyTokenizer {
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
+    fn decode(
+        &self,
+        ids: &Bound<'_, PyAny>,
+        skip_special_tokens: bool,
+    ) -> PyResult<String> {
+        let ids = Self::extract_decode_ids(ids)?;
         self.read()
             .inner
             .decode(&ids, skip_special_tokens)
@@ -1052,9 +1088,10 @@ impl PyTokenizer {
     #[pyo3(signature = (sentences, skip_special_tokens = false))]
     fn decode_batch(
         &self,
-        sentences: Vec<Vec<u32>>,
+        sentences: &Bound<'_, PyAny>,
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
+        let sentences = Self::extract_decode_batch_ids(sentences)?;
         let state = self.read();
         let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
         state

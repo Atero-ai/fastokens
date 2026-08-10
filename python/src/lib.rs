@@ -1087,11 +1087,7 @@ impl PyTokenizer {
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(
-        &self,
-        ids: &Bound<'_, PyAny>,
-        skip_special_tokens: bool,
-    ) -> PyResult<String> {
+    fn decode(&self, ids: &Bound<'_, PyAny>, skip_special_tokens: bool) -> PyResult<String> {
         let ids = Self::extract_decode_ids(ids)?;
         self.read()
             .inner
@@ -1194,7 +1190,6 @@ mod tests {
         assert_eq!(enc.attention_mask, vec![0u32, 0, 1, 1, 1]);
         assert_eq!(enc.type_ids, vec![7u32, 7, 0, 0, 0]);
     }
-
 }
 
 // ---------------------------------------------------------------------------

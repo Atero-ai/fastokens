@@ -15,9 +15,12 @@ from pathlib import Path
 
 from fastokens._native import Encoding, Tokenizer
 
+
 # Backwards-compatibility alias used by tests and any code that imports
 # _Encoding directly from this module.
 _Encoding = Encoding
+
+_UINT32_MAX = (1 << 32) - 1
 
 def _pcre2_options(
     pcre2_match_limit: int | None = None,
@@ -292,15 +295,39 @@ class _TokenizerShim:
 
     # -- Decoding -------------------------------------------------------
 
+    @staticmethod
+    def _drop_invalid_decode_ids(ids: list[int]) -> list[int]:
+        return [token_id for token_id in ids if 0 <= token_id <= _UINT32_MAX]
+
+    def _decode_with_retry(
+        self, decode_fn, payload, sanitize, *, skip_special_tokens: bool
+    ):
+        try:
+            return decode_fn(payload, skip_special_tokens=skip_special_tokens)
+        except OverflowError:
+            return decode_fn(
+                sanitize(payload), skip_special_tokens=skip_special_tokens
+            )
+
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
-        return self._fast.decode(ids, skip_special_tokens=skip_special_tokens)
+        return self._decode_with_retry(
+            self._fast.decode,
+            ids,
+            self._drop_invalid_decode_ids,
+            skip_special_tokens=skip_special_tokens,
+        )
 
     def decode_batch(
         self,
         sequences: list[list[int]],
         skip_special_tokens: bool = True,
     ) -> list[str]:
-        return self._fast.decode_batch(sequences, skip_special_tokens=skip_special_tokens)
+        return self._decode_with_retry(
+            self._fast.decode_batch,
+            sequences,
+            lambda batch: [self._drop_invalid_decode_ids(ids) for ids in batch],
+            skip_special_tokens=skip_special_tokens,
+        )
 
     # -- Vocabulary -----------------------------------------------------
 

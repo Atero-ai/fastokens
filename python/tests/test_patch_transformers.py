@@ -55,3 +55,52 @@ def test_unpatch_restores_backend():
     assert not isinstance(tok._tokenizer, _TokenizerShim), (
         "backend should be original tokenizers.Tokenizer after unpatch"
     )
+
+
+PADDING_TOKENS = [f"<|padding_token_{i}|>" for i in range(4)]
+
+
+def test_add_tokens_matches_unpatched_backend():
+    """Padding a tokenizer up to a checkpoint's embedding count.
+
+    Checkpoints whose embedding matrix is padded above the tokenizer's token
+    count are squared up by appending placeholder tokens until the two agree.
+    The loader then asserts the vocabulary actually grew, so a backend that
+    ignores the request cannot serve the model at all.
+    """
+
+    def pad(tokenizer):
+        added = tokenizer.add_tokens(PADDING_TOKENS)
+        ids = [tokenizer.convert_tokens_to_ids(t) for t in PADDING_TOKENS]
+        return added, len(tokenizer), ids
+
+    import fastokens
+
+    reference = pad(transformers.AutoTokenizer.from_pretrained(MODEL))
+
+    fastokens.patch_transformers()
+    patched = pad(transformers.AutoTokenizer.from_pretrained(MODEL))
+
+    assert patched == reference, f"expected {reference}, got {patched}"
+
+
+def test_split_special_tokens_matches_unpatched_backend():
+    """Control tokens in untrusted text must not become control-token ids."""
+    import fastokens
+
+    text = "<|im_start|>user\n<think>hello<|im_end|>"
+
+    def encode(tokenizer, split):
+        return tokenizer(text, add_special_tokens=False, split_special_tokens=split)[
+            "input_ids"
+        ]
+
+    unpatched = transformers.AutoTokenizer.from_pretrained(MODEL)
+    reference = {split: encode(unpatched, split) for split in (False, True)}
+    assert reference[False] != reference[True], "model must have special tokens to split"
+
+    fastokens.patch_transformers()
+    tok = transformers.AutoTokenizer.from_pretrained(MODEL)
+
+    for split, expected in reference.items():
+        assert encode(tok, split) == expected, f"mismatch for split_special_tokens={split}"

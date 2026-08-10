@@ -60,6 +60,23 @@ tokens = tokenizer("Hello, world!")
 assert tokens["input_ids"] == [22177, 1044, 4304, 1033]
 ```
 
+#### Extending the vocabulary
+
+`add_tokens` / `add_special_tokens` work as they do on a `tokenizers` backend,
+assigning the same ids. This is what serving stacks call to reconcile a
+checkpoint whose embedding matrix is padded above the tokenizer's token count:
+placeholder tokens are appended until the two agree.
+
+```python
+tokenizer.add_tokens([f"<|padding_token_{i}|>" for i in range(num_embeddings - len(tokenizer))])
+assert len(tokenizer) == num_embeddings
+```
+
+Passing `split_special_tokens=True` encodes special tokens found in the text as
+ordinary text instead of as control-token ids, so a control token appearing in
+untrusted input cannot be injected. The rest of the added vocabulary still
+matches; re-register those tokens as special first to cover them too.
+
 ### Standalone usage
 
 ```python

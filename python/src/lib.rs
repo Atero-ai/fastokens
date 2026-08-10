@@ -443,6 +443,40 @@ impl TokenizerState {
     }
 }
 
+/// A token to add to the vocabulary, extracted from any object exposing the
+/// attributes of a `tokenizers.AddedToken` (which `transformers` hands to
+/// `add_tokens`).
+#[derive(FromPyObject)]
+struct PyNewToken {
+    content: String,
+    single_word: bool,
+    lstrip: bool,
+    rstrip: bool,
+    normalized: bool,
+    special: bool,
+}
+
+impl From<PyNewToken> for fastokens::NewToken {
+    fn from(token: PyNewToken) -> Self {
+        Self {
+            content: token.content,
+            single_word: token.single_word,
+            lstrip: token.lstrip,
+            rstrip: token.rstrip,
+            normalized: token.normalized,
+            special: token.special,
+        }
+    }
+}
+
+fn added_token_policy(split_special_tokens: bool) -> fastokens::AddedTokenPolicy {
+    if split_special_tokens {
+        fastokens::AddedTokenPolicy::SkipSpecial
+    } else {
+        fastokens::AddedTokenPolicy::All
+    }
+}
+
 /// An LLM tokenizer backed by `tokenizer.json`.
 #[pyclass(name = "Tokenizer")]
 struct PyTokenizer {
@@ -823,19 +857,30 @@ impl PyTokenizer {
 
     /// Run the full encoding pipeline.
     ///
+    /// With `split_special_tokens`, special added tokens in `input` are encoded
+    /// as ordinary text instead of as control-token IDs; the rest of the added
+    /// vocabulary still matches. This is what `transformers` asks for when a
+    /// caller passes `split_special_tokens=True` to keep untrusted text from
+    /// producing control tokens.
+    ///
     /// Truncation and padding configured via `enable_truncation` /
     /// `enable_padding` are applied before returning.
-    #[pyo3(signature = (input, add_special_tokens = false))]
+    #[pyo3(signature = (input, add_special_tokens = false, split_special_tokens = false))]
     fn encode(
         &self,
         input: &str,
         add_special_tokens: bool,
+        split_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
         let state = self.read();
         let ids = state
             .inner
-            .encode_with_special_tokens(input, add_special_tokens)
+            .encode_with_policy(
+                input,
+                add_special_tokens,
+                added_token_policy(split_special_tokens),
+            )
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Py::new(py, state.build_single_encoding(ids))
     }
@@ -885,24 +930,28 @@ impl PyTokenizer {
 
     /// Encode a batch of inputs in parallel.
     ///
+    /// `split_special_tokens` has the same meaning as in [`Self::encode`].
+    ///
     /// Truncation is applied per-sequence; padding (if enabled) pads the
     /// batch to a uniform length.
-    #[pyo3(signature = (inputs, add_special_tokens = false))]
+    #[pyo3(signature = (inputs, add_special_tokens = false, split_special_tokens = false))]
     fn encode_batch(
         &self,
         inputs: Vec<String>,
         add_special_tokens: bool,
+        split_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyEncoding>>> {
         use rayon::prelude::*;
 
+        let policy = added_token_policy(split_special_tokens);
         let state = self.read();
         let mut batch: Vec<Vec<u32>> = inputs
             .par_iter()
             .map(|s| {
                 state
                     .inner
-                    .encode_with_special_tokens(s.as_str(), add_special_tokens)
+                    .encode_with_policy(s.as_str(), add_special_tokens, policy)
                     .map_err(|e| PyValueError::new_err(e.to_string()))
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -941,15 +990,21 @@ impl PyTokenizer {
     /// the whole result is two buffers — which is what makes bulk encoding fast
     /// from Python. Truncation is applied per input; padding does not apply
     /// (the result is ragged, addressed by `offsets`).
-    #[pyo3(signature = (inputs, add_special_tokens = false))]
+    ///
+    /// `split_special_tokens` has the same meaning as in [`Self::encode`], so
+    /// the bulk path can suppress control-token IDs for untrusted input the
+    /// same way the per-encoding paths do.
+    #[pyo3(signature = (inputs, add_special_tokens = false, split_special_tokens = false))]
     fn encode_batch_flat<'py>(
         &self,
         inputs: Vec<String>,
         add_special_tokens: bool,
+        split_special_tokens: bool,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         use rayon::prelude::*;
 
+        let policy = added_token_policy(split_special_tokens);
         let state = self.read();
         let mut batch: Vec<Vec<u32>> = py.allow_threads(|| {
             inputs
@@ -957,7 +1012,7 @@ impl PyTokenizer {
                 .map(|s| {
                     state
                         .inner
-                        .encode_with_special_tokens(s.as_str(), add_special_tokens)
+                        .encode_with_policy(s.as_str(), add_special_tokens, policy)
                         .map_err(|e| PyValueError::new_err(e.to_string()))
                 })
                 .collect::<PyResult<Vec<_>>>()
@@ -1079,6 +1134,51 @@ impl PyTokenizer {
     #[getter]
     fn vocab_size(&self) -> usize {
         self.read().inner.vocab_size()
+    }
+
+    /// The added-vocabulary entries, as `tokenizer.json` would serialize them.
+    ///
+    /// Reflects tokens added since construction, so callers that re-serialize
+    /// the tokenizer do not lose them.
+    fn added_tokens<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.read()
+            .inner
+            .added_token_configs()
+            .iter()
+            .map(|config| {
+                let entry = PyDict::new(py);
+                entry.set_item("id", config.id)?;
+                entry.set_item("content", &config.content)?;
+                entry.set_item("single_word", config.single_word)?;
+                entry.set_item("lstrip", config.lstrip)?;
+                entry.set_item("rstrip", config.rstrip)?;
+                entry.set_item("normalized", config.normalized)?;
+                entry.set_item("special", config.special)?;
+                Ok(entry)
+            })
+            .collect()
+    }
+
+    /// Extend the vocabulary, returning the `(content, id)` of every entry
+    /// created or changed.
+    ///
+    /// `tokens` are objects carrying the attributes of a
+    /// `tokenizers.AddedToken`. IDs are assigned exactly as HuggingFace
+    /// `tokenizers` assigns them: a content already in the vocabulary keeps its
+    /// ID (only its flags can change), anything else is appended above the
+    /// vocabulary. Adding a content that is already present with the same flags
+    /// changes nothing and is not reported.
+    fn add_tokens(&self, tokens: Vec<PyNewToken>) -> PyResult<Vec<(String, u32)>> {
+        let tokens: Vec<fastokens::NewToken> = tokens.into_iter().map(Into::into).collect();
+        let added = self
+            .write()
+            .inner
+            .add_tokens(&tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(added
+            .into_iter()
+            .map(|config| (config.content, config.id))
+            .collect())
     }
 }
 

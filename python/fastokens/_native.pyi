@@ -1,4 +1,14 @@
-from typing import Optional
+from typing import Any, Optional, Protocol
+
+class AddedTokenLike(Protocol):
+    """Any object with the attributes of a ``tokenizers.AddedToken``."""
+
+    content: str
+    single_word: bool
+    lstrip: bool
+    rstrip: bool
+    normalized: bool
+    special: bool
 
 class Encoding:
     """Rust-backed encoding returned by tokenizer encoding methods."""
@@ -156,7 +166,18 @@ class Tokenizer:
 
     def num_special_tokens_to_add(self, is_pair: bool) -> int: ...
 
-    def encode(self, input: str, add_special_tokens: bool = False) -> Encoding: ...
+    def encode(
+        self,
+        input: str,
+        add_special_tokens: bool = False,
+        split_special_tokens: bool = False,
+    ) -> Encoding:
+        """Encode ``input``.
+
+        With ``split_special_tokens``, special added tokens are encoded as
+        ordinary text rather than as control-token ids; the rest of the added
+        vocabulary still matches."""
+
     def encode_ordinary(self, input: str) -> Encoding: ...
     def encode_segments(self, segments: list[tuple[str, bool]]) -> Encoding:
         """Encode a pre-segmented input, concatenating each segment's token ids.
@@ -167,10 +188,16 @@ class Tokenizer:
         segmented encoding; no post-processor special tokens are inserted."""
 
     def encode_batch(
-        self, inputs: list[str], add_special_tokens: bool = False
+        self,
+        inputs: list[str],
+        add_special_tokens: bool = False,
+        split_special_tokens: bool = False,
     ) -> list[Encoding]: ...
     def encode_batch_flat(
-        self, inputs: list[str], add_special_tokens: bool = False
+        self,
+        inputs: list[str],
+        add_special_tokens: bool = False,
+        split_special_tokens: bool = False,
     ) -> tuple[bytes, bytes]:
         """Encode a batch into a single flat token buffer for high-throughput
         bulk tokenization. Returns ``(ids, offsets)``: ``ids`` is every input's
@@ -191,3 +218,15 @@ class Tokenizer:
 
     def token_to_id(self, token: str) -> Optional[int]: ...
     def id_to_token(self, id: int) -> Optional[str]: ...
+
+    def added_tokens(self) -> list[dict[str, Any]]:
+        """The added-vocabulary entries, as ``tokenizer.json`` serializes them,
+        including any added since construction."""
+
+    def add_tokens(self, tokens: list[AddedTokenLike]) -> list[tuple[str, int]]:
+        """Extend the vocabulary, returning the ``(content, id)`` of every entry
+        created or changed.
+
+        Ids are assigned as HuggingFace ``tokenizers`` assigns them: a content
+        already in the vocabulary keeps its id and only its flags can change,
+        anything else is appended above the vocabulary."""

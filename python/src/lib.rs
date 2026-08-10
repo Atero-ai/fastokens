@@ -484,6 +484,52 @@ struct PyTokenizer {
 }
 
 impl PyTokenizer {
+    /// Collect the elements of a Python id sequence that are integers
+    /// representable as `i64`, skipping the rest.
+    ///
+    /// The fast path in [`Self::extract_decode_ids`] handles a clean list of
+    /// in-range `u32`s. This is the fallback: it drops anything that cannot be
+    /// a token id — negatives, values above `u32::MAX`, ints too large for
+    /// `i64`, and non-integers such as floats (`inf`/`-inf`/`nan`), any of
+    /// which would otherwise abort the whole decode.
+    fn extract_valid_decode_ids(ids: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+        let iter = ids.try_iter()?;
+        let mut out = Vec::with_capacity(ids.len().unwrap_or(0));
+        for item in iter {
+            if let Ok(value) = item?.extract::<i64>()
+                && (0..=u32::MAX as i64).contains(&value)
+            {
+                out.push(value as u32);
+            }
+        }
+        Ok(out)
+    }
+
+    fn extract_decode_ids(ids: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+        // Fast path: a clean list of in-range u32s extracts in one bulk call.
+        // Any rejected element (negative, > u32::MAX, > i64, or a non-integer
+        // such as a float) drops to the element-wise fallback, which skips the
+        // offending ids instead of failing the whole decode.
+        match ids.extract::<Vec<u32>>() {
+            Ok(ids) => Ok(ids),
+            Err(_) => Self::extract_valid_decode_ids(ids),
+        }
+    }
+
+    fn extract_decode_batch_ids(sentences: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u32>>> {
+        match sentences.extract::<Vec<Vec<u32>>>() {
+            Ok(sentences) => Ok(sentences),
+            Err(_) => {
+                let iter = sentences.try_iter()?;
+                let mut out = Vec::with_capacity(sentences.len().unwrap_or(0));
+                for seq in iter {
+                    out.push(Self::extract_valid_decode_ids(&seq?)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
         self.state.read().expect("PyTokenizer state lock poisoned")
     }
@@ -1096,7 +1142,8 @@ impl PyTokenizer {
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
+    fn decode(&self, ids: &Bound<'_, PyAny>, skip_special_tokens: bool) -> PyResult<String> {
+        let ids = Self::extract_decode_ids(ids)?;
         self.read()
             .inner
             .decode(&ids, skip_special_tokens)
@@ -1107,9 +1154,10 @@ impl PyTokenizer {
     #[pyo3(signature = (sentences, skip_special_tokens = false))]
     fn decode_batch(
         &self,
-        sentences: Vec<Vec<u32>>,
+        sentences: &Bound<'_, PyAny>,
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
+        let sentences = Self::extract_decode_batch_ids(sentences)?;
         let state = self.read();
         let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
         state

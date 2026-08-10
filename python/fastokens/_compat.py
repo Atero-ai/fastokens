@@ -15,6 +15,7 @@ from pathlib import Path
 
 from fastokens._native import Encoding, Tokenizer
 
+
 # Backwards-compatibility alias used by tests and any code that imports
 # _Encoding directly from this module.
 _Encoding = Encoding
@@ -350,7 +351,9 @@ class _TokenizerShim:
         sequences: list[list[int]],
         skip_special_tokens: bool = True,
     ) -> list[str]:
-        return self._fast.decode_batch(sequences, skip_special_tokens=skip_special_tokens)
+        return self._fast.decode_batch(
+            sequences, skip_special_tokens=skip_special_tokens
+        )
 
     # -- Vocabulary -----------------------------------------------------
 

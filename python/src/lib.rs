@@ -990,15 +990,21 @@ impl PyTokenizer {
     /// the whole result is two buffers — which is what makes bulk encoding fast
     /// from Python. Truncation is applied per input; padding does not apply
     /// (the result is ragged, addressed by `offsets`).
-    #[pyo3(signature = (inputs, add_special_tokens = false))]
+    ///
+    /// `split_special_tokens` has the same meaning as in [`Self::encode`], so
+    /// the bulk path can suppress control-token IDs for untrusted input the
+    /// same way the per-encoding paths do.
+    #[pyo3(signature = (inputs, add_special_tokens = false, split_special_tokens = false))]
     fn encode_batch_flat<'py>(
         &self,
         inputs: Vec<String>,
         add_special_tokens: bool,
+        split_special_tokens: bool,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         use rayon::prelude::*;
 
+        let policy = added_token_policy(split_special_tokens);
         let state = self.read();
         let mut batch: Vec<Vec<u32>> = py.allow_threads(|| {
             inputs
@@ -1006,7 +1012,7 @@ impl PyTokenizer {
                 .map(|s| {
                     state
                         .inner
-                        .encode_with_special_tokens(s.as_str(), add_special_tokens)
+                        .encode_with_policy(s.as_str(), add_special_tokens, policy)
                         .map_err(|e| PyValueError::new_err(e.to_string()))
                 })
                 .collect::<PyResult<Vec<_>>>()

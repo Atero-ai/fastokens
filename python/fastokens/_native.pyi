@@ -194,7 +194,10 @@ class Tokenizer:
         split_special_tokens: bool = False,
     ) -> list[Encoding]: ...
     def encode_batch_flat(
-        self, inputs: list[str], add_special_tokens: bool = False
+        self,
+        inputs: list[str],
+        add_special_tokens: bool = False,
+        split_special_tokens: bool = False,
     ) -> tuple[bytes, bytes]:
         """Encode a batch into a single flat token buffer for high-throughput
         bulk tokenization. Returns ``(ids, offsets)``: ``ids`` is every input's

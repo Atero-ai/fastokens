@@ -166,12 +166,41 @@ class _TokenizerShim:
         cfg = json.loads(self._json)
         cfg["truncation"] = self._fast.truncation
         cfg["padding"] = self._fast.padding
-        # Read the added tokens back from the backend rather than the source
-        # JSON, so tokens added after construction survive serialization.
-        cfg["added_tokens"] = self._fast.added_tokens()
+        cfg["added_tokens"] = self._added_tokens(cfg.get("added_tokens") or [])
         if pretty:
             return json.dumps(cfg, indent=2, ensure_ascii=False)
         return json.dumps(cfg, ensure_ascii=False)
+
+    def _added_tokens(self, source: list[dict] | None = None) -> list[dict]:
+        """The effective ``added_tokens`` array: source entries plus any added
+        after construction.
+
+        Source-JSON entries are kept verbatim so a load/save round-trip does not
+        rewrite fields the backend defaults differently — notably ``normalized``,
+        which the backend stores as ``False`` when a source entry omits it but
+        HuggingFace treats as ``True``. The live ``special`` flag is overlaid so
+        promotions via :meth:`add_special_tokens` are reflected, and tokens added
+        after construction are appended in id order.
+        """
+        if source is None:
+            source = json.loads(self._json).get("added_tokens") or []
+        live_by_id = {entry["id"]: entry for entry in self._fast.added_tokens()}
+        result: list[dict] = []
+        seen: set[int] = set()
+        for entry in source:
+            tid = entry.get("id")
+            seen.add(tid)
+            live = live_by_id.get(tid)
+            if live is None:
+                result.append(entry)
+            else:
+                # Only `special` can change for a token already declared in the
+                # source JSON (a promotion); every other field is immutable.
+                result.append({**entry, "special": live["special"]})
+        for tid, live in live_by_id.items():
+            if tid not in seen:
+                result.append(live)
+        return result
 
     def save(self, path: str, pretty: bool = True) -> None:
         Path(path).write_text(self.to_str(pretty=pretty), encoding="utf-8")
@@ -332,6 +361,18 @@ class _TokenizerShim:
         return self._fast.token_to_id(token)
 
     def get_vocab(self, with_added_tokens: bool = True) -> dict[str, int]:
+        added = self._fast.added_tokens()
+        if not with_added_tokens:
+            # Exclude the added vocabulary so `transformers.get_added_vocab()`,
+            # which diffs `get_vocab(False)` against `get_vocab(True)`, actually
+            # sees the added tokens instead of an empty difference.
+            added_ids = {entry["id"] for entry in added}
+            return {
+                tok: i
+                for i in range(self._fast.vocab_size)
+                if i not in added_ids
+                and (tok := self._fast.id_to_token(i)) is not None
+            }
         vocab = {}
         for i in range(self._fast.vocab_size):
             tok = self._fast.id_to_token(i)
@@ -339,7 +380,7 @@ class _TokenizerShim:
                 vocab[tok] = i
         # An added token can sit above the vocabulary size when the declared ids
         # leave a gap, so the id scan alone can miss one.
-        for entry in self._fast.added_tokens():
+        for entry in added:
             vocab[entry["content"]] = entry["id"]
         return vocab
 
@@ -352,17 +393,22 @@ class _TokenizerShim:
         return self._fast.vocab_size
 
     def get_added_tokens_decoder(self) -> dict[int, object]:
-        return {
-            entry["id"]: _AddedTokenInfo(
-                content=entry["content"],
-                single_word=entry["single_word"],
-                lstrip=entry["lstrip"],
-                rstrip=entry["rstrip"],
-                normalized=entry["normalized"],
-                special=entry["special"],
+        result: dict[int, object] = {}
+        for entry in self._added_tokens():
+            tid = entry.get("id")
+            if tid is None:
+                continue
+            result[tid] = _AddedTokenInfo(
+                content=entry.get("content", ""),
+                single_word=entry.get("single_word", False),
+                lstrip=entry.get("lstrip", False),
+                rstrip=entry.get("rstrip", False),
+                # HuggingFace treats a missing `normalized` as True; the backend
+                # would report False, so default here from the source entry.
+                normalized=entry.get("normalized", True),
+                special=entry.get("special", False),
             )
-            for entry in self._fast.added_tokens()
-        }
+        return result
 
     # -- Token management -----------------------------------------------
 
@@ -385,18 +431,34 @@ class _TokenizerShim:
         return self._add_tokens(special_tokens, special=True)
 
     def _add_tokens(self, tokens, special: bool) -> int:
-        specs = [
-            token
-            if hasattr(token, "content")
-            # `AddedToken.from(content, special)` leaves special tokens
-            # unnormalized; mirror that for bare strings.
-            else _AddedTokenInfo(content=token, normalized=not special, special=special)
-            for token in tokens
-        ]
+        specs = [self._coerce_token(token, special) for token in tokens]
         added = self._fast.add_tokens(specs)
         if added:
             self._vocab_extended = True
         return len(added)
+
+    @staticmethod
+    def _coerce_token(token, special: bool):
+        if not hasattr(token, "content"):
+            # `AddedToken.from(content, special)` leaves special tokens
+            # unnormalized; mirror that for bare strings.
+            return _AddedTokenInfo(content=token, normalized=not special, special=special)
+        if special and not getattr(token, "special", False):
+            # `Tokenizer.add_special_tokens` always marks its arguments special
+            # in HuggingFace; an `AddedToken(..., special=False)` passed here
+            # must still be registered special, or `encode_special_tokens` would
+            # not skip it and a control-token string in untrusted input would
+            # produce a real control-token id. Copy the object's flags rather
+            # than mutating the caller's object.
+            return _AddedTokenInfo(
+                content=token.content,
+                single_word=getattr(token, "single_word", False),
+                lstrip=getattr(token, "lstrip", False),
+                rstrip=getattr(token, "rstrip", False),
+                normalized=getattr(token, "normalized", True),
+                special=True,
+            )
+        return token
 
     # -- Component accessors --------------------------------------------
 

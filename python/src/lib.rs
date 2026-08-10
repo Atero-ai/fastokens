@@ -1,6 +1,6 @@
 use std::sync::RwLock;
 
-use pyo3::exceptions::{PyNotImplementedError, PyOverflowError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::Value;
@@ -450,34 +450,49 @@ struct PyTokenizer {
 }
 
 impl PyTokenizer {
-    fn sanitize_decode_ids(ids: Vec<i64>) -> Vec<u32> {
-        ids.into_iter()
-            .filter_map(|id| (0..=u32::MAX as i64).contains(&id).then_some(id as u32))
-            .collect()
+    /// Collect the elements of a Python id sequence that are integers
+    /// representable as `i64`, skipping the rest.
+    ///
+    /// The fast path in [`Self::extract_decode_ids`] handles a clean list of
+    /// in-range `u32`s. This is the fallback: it drops anything that cannot be
+    /// a token id — negatives, values above `u32::MAX`, ints too large for
+    /// `i64`, and non-integers such as floats (`inf`/`-inf`/`nan`), any of
+    /// which would otherwise abort the whole decode.
+    fn extract_valid_decode_ids(ids: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+        let iter = ids.try_iter()?;
+        let mut out = Vec::with_capacity(ids.len().unwrap_or(0));
+        for item in iter {
+            if let Ok(value) = item?.extract::<i64>()
+                && (0..=u32::MAX as i64).contains(&value)
+            {
+                out.push(value as u32);
+            }
+        }
+        Ok(out)
     }
 
     fn extract_decode_ids(ids: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+        // Fast path: a clean list of in-range u32s extracts in one bulk call.
+        // Any rejected element (negative, > u32::MAX, > i64, or a non-integer
+        // such as a float) drops to the element-wise fallback, which skips the
+        // offending ids instead of failing the whole decode.
         match ids.extract::<Vec<u32>>() {
             Ok(ids) => Ok(ids),
-            Err(err) if err.is_instance_of::<PyOverflowError>(ids.py()) => {
-                let ids = ids.extract::<Vec<i64>>()?;
-                Ok(Self::sanitize_decode_ids(ids))
-            }
-            Err(err) => Err(err),
+            Err(_) => Self::extract_valid_decode_ids(ids),
         }
     }
 
     fn extract_decode_batch_ids(sentences: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u32>>> {
         match sentences.extract::<Vec<Vec<u32>>>() {
             Ok(sentences) => Ok(sentences),
-            Err(err) if err.is_instance_of::<PyOverflowError>(sentences.py()) => {
-                let sentences = sentences.extract::<Vec<Vec<i64>>>()?;
-                Ok(sentences
-                    .into_iter()
-                    .map(Self::sanitize_decode_ids)
-                    .collect())
+            Err(_) => {
+                let iter = sentences.try_iter()?;
+                let mut out = Vec::with_capacity(sentences.len().unwrap_or(0));
+                for seq in iter {
+                    out.push(Self::extract_valid_decode_ids(&seq?)?);
+                }
+                Ok(out)
             }
-            Err(err) => Err(err),
         }
     }
 

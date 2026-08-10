@@ -44,6 +44,27 @@ def test_encode_decode_through_shim():
     assert "Hello" in decoded, f"unexpected decode: {decoded!r}"
 
 
+def test_decode_ignores_ids_outside_uint32():
+    """Fast decode should drop invalid IDs instead of raising."""
+    import fastokens
+
+    fastokens.patch_transformers()
+
+    tok = transformers.AutoTokenizer.from_pretrained(MODEL)
+    valid = tok("Hello, world!")["input_ids"]
+    mixed = valid[:2] + [-1, 2**32] + valid[2:]
+
+    assert tok.decode(mixed, skip_special_tokens=True) == tok.decode(
+        valid, skip_special_tokens=True
+    )
+
+    batch_valid = [valid, valid]
+    batch_mixed = [mixed, valid[:1] + [-1] + valid[1:]]
+    assert tok.batch_decode(batch_mixed, skip_special_tokens=True) == tok.batch_decode(
+        batch_valid, skip_special_tokens=True
+    )
+
+
 def test_unpatch_restores_backend():
     """After unpatching, from_pretrained should return the original backend."""
     import fastokens

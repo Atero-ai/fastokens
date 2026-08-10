@@ -450,6 +450,12 @@ struct PyTokenizer {
 }
 
 impl PyTokenizer {
+    fn sanitize_decode_ids(ids: Vec<i64>) -> Vec<u32> {
+        ids.into_iter()
+            .filter_map(|id| (0..=u32::MAX as i64).contains(&id).then_some(id as u32))
+            .collect()
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
         self.state.read().expect("PyTokenizer state lock poisoned")
     }
@@ -1041,7 +1047,8 @@ impl PyTokenizer {
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
+    fn decode(&self, ids: Vec<i64>, skip_special_tokens: bool) -> PyResult<String> {
+        let ids = Self::sanitize_decode_ids(ids);
         self.read()
             .inner
             .decode(&ids, skip_special_tokens)
@@ -1052,11 +1059,15 @@ impl PyTokenizer {
     #[pyo3(signature = (sentences, skip_special_tokens = false))]
     fn decode_batch(
         &self,
-        sentences: Vec<Vec<u32>>,
+        sentences: Vec<Vec<i64>>,
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
         let state = self.read();
-        let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
+        let sanitized: Vec<Vec<u32>> = sentences
+            .into_iter()
+            .map(Self::sanitize_decode_ids)
+            .collect();
+        let refs: Vec<&[u32]> = sanitized.iter().map(Vec::as_slice).collect();
         state
             .inner
             .decode_batch(&refs, skip_special_tokens)
@@ -1141,6 +1152,15 @@ mod tests {
         assert_eq!(enc.ids, vec![0u32, 0, 10, 20, 30]);
         assert_eq!(enc.attention_mask, vec![0u32, 0, 1, 1, 1]);
         assert_eq!(enc.type_ids, vec![7u32, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sanitize_decode_ids_filters_out_of_range_values() {
+        let ids = vec![1_i64, -1, 2, i64::from(u32::MAX) + 1, 3];
+        assert_eq!(
+            PyTokenizer::sanitize_decode_ids(ids),
+            vec![1_u32, 2, 3]
+        );
     }
 }
 
